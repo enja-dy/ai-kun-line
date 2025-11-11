@@ -9,6 +9,8 @@
   "dependencies": {
     "@line/bot-sdk": "^9.0.0",
     "express": "^4.19.2",
-    "openai": "^4.57.0"
+    "openai": "^4.57.0",
+    "@supabase/supabase-js": "^2.39.3"
   }
 }
+
