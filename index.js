@@ -19,10 +19,10 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-/** ====== SerpAPI 設定（Google検索の簡易導入） ====== */
+/** ====== SerpAPI（Google検索の簡易導入） ====== */
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
-/** ====== 親しみやすい SYSTEM_PROMPT（自然文を維持） ====== */
+/** ====== 親しみ＋正確性重視 SYSTEM_PROMPT ====== */
 const SYSTEM_PROMPT = `
 あなたは「AIくん」です。相手に寄りそい、親しみやすい口調で、自然な日本語の文章で答えてください。
 箇条書きは必要に応じて軽く使ってOKですが、毎回同じ形式にはしないでください。
@@ -78,27 +78,38 @@ async function saveMessage(conversationId, role, content) {
   if (error) console.error("saveMessage error:", error);
 }
 
-/** ====== どの質問で検索するか（場所/最新/料金/営業時間など） ====== */
+/** ====== 検索発火条件（場所/最新/料金/営業時間など） ====== */
 const PLACE_HINTS = [
   /どこ|場所|住所|地図|最寄り|近く|アクセス|電話|営業時間|定休日|何時まで/,
-  /カフェ|居酒屋|レストラン|病院|クリニック|ホテル|温泉|レンタカー|美術館|水族館|動物園|図書館|保育園|幼稚園|役所/,
-  /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|渋谷|新宿|池袋|銀座|梅田|難波|天神|博多|横浜/
+  /カフェ|居酒屋|レストラン|病院|クリニック|ホテル|温泉|レンタカー|美術館|水族館|動物園|図書館|保育園|幼稚園|役所|コンビニ|ATM|コインランドリー/,
+  /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|横浜|神戸|鎌倉|川崎|千葉|埼玉/,
+  /渋谷|新宿|池袋|銀座|秋葉原|上野|品川|恵比寿|中目黒|自由が丘|下北沢|吉祥寺|梅田|難波|天神|博多/
 ];
 const FACT_HINTS = [
   /最新|今日|昨日|今週|今月|今年|速報|本日/,
   /ニュース|発表|値上げ|値下げ|価格|料金|在庫|為替|金利|相場|スケジュール|日程|統計|人数|売上|利用者|シェア/,
-  /法律|規制|規約|仕様|バージョン/,
+  /法律|規制|規約|仕様|バージョン/
 ];
 
 function needsSearch(userText) {
   if (!userText) return false;
   const t = userText.toLowerCase();
-  if (t.includes("検証モード")) return true;   // 手動強制
-  if (t.includes("オフライン")) return false; // 手動オフ
+  if (t.includes("検証モード")) return true;    // 手動強制
+  if (t.includes("オフライン")) return false;  // 手動オフ
   return [...PLACE_HINTS, ...FACT_HINTS].some(re => re.test(userText));
 }
 
-/** ====== SerpAPIでGoogle検索（簡易） ====== */
+/** 地名・ランドマーク等が含まれているか簡易判定 */
+function hasPlaceWord(userText) {
+  if (!userText) return false;
+  return [
+    /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|横浜|神戸|鎌倉|川崎|千葉|埼玉/,
+    /渋谷|新宿|池袋|銀座|秋葉原|上野|品川|恵比寿|中目黒|自由が丘|下北沢|吉祥寺|梅田|難波|天王寺|心斎橋|三宮|元町|天神|博多|大濠|中洲/,
+    /駅|区|市|町|村|温泉|空港|港|インター|PA|SA|タワー|ドーム|アリーナ|ヒルズ|シティ|モール/,
+  ].some(re => re.test(userText));
+}
+
+/** ====== SerpAPIでGoogle検索 ====== */
 async function webSearch(query, num = 5, gl = "jp", hl = "ja") {
   if (!SERPAPI_KEY) return [];
   const url =
@@ -157,7 +168,15 @@ async function handleEvent(event) {
   // 直近履歴
   const history = await fetchRecentMessages(conversationId);
 
-  // 必要なときだけ検索
+  // ▼ 「近くの〜？」など → 検索したいが地名が無い → まず場所を聞く（LLMに投げない）
+  if (needsSearch(userText) && !hasPlaceWord(userText)) {
+    const reply = "了解！調べるね。今どこにいますか？";
+    await saveMessage(conversationId, "assistant", reply);
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: reply });
+    return;
+  }
+
+  // 必要なときだけ検索（地名あり or 事実系）
   let sources = [];
   if (needsSearch(userText)) {
     try {
