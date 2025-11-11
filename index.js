@@ -19,19 +19,28 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-/** ====== 親しみやすい SYSTEM_PROMPT ====== */
+/** ====== SerpAPI 設定（Google検索の簡易導入） ====== */
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
+
+/** ====== 親しみやすい SYSTEM_PROMPT（自然文を維持） ====== */
 const SYSTEM_PROMPT = `
 あなたは「AIくん」です。相手に寄りそい、親しみやすい口調で、自然な日本語の文章で答えてください。
 箇条書きは必要に応じて軽く使ってOKですが、毎回同じ形式にはしないでください。
 提案の根拠や具体例は簡潔に。必要なら追加の質問を1つだけ添えて会話を広げてください。
 
+【正確性のルール】
+- 日付、統計、制度、料金、人数、最新情報、店舗・施設の住所/営業時間など事実依存の内容は、
+  可能であれば渡された sources を参考にしてください。
+- sources が十分でない場合は断定せず、「可能性」「要確認」と表現してください。
+
 【避けること】
 - 「公式サイトを確認してください」だけで終わる
 - 「わかりません」で終わる
 - 一般論だけで終える
+- sources があるのに無視する
 `;
 
-/** ====== 会話ID（1:1/グループ/ルーム対応） ====== */
+/** ====== 会話ID ====== */
 function getConversationId(event) {
   const src = event.source ?? {};
   if (src.groupId) return `group:${src.groupId}`;
@@ -41,7 +50,7 @@ function getConversationId(event) {
 }
 
 /** ====== 履歴保存/取得 ====== */
-const HISTORY_LIMIT = 12; // 直近の user/assistant を取り回し（6往復イメージ）
+const HISTORY_LIMIT = 12;
 
 async function fetchRecentMessages(conversationId) {
   const { data, error } = await supabase
@@ -57,9 +66,9 @@ async function fetchRecentMessages(conversationId) {
   }
 
   return (data ?? [])
-    .reverse() // 古→新
-    .map((r) => ({ role: r.role, content: r.content }))
-    .filter((m) => m.role === "user" || m.role === "assistant");
+    .reverse()
+    .map(r => ({ role: r.role, content: r.content }))
+    .filter(m => m.role === "user" || m.role === "assistant");
 }
 
 async function saveMessage(conversationId, role, content) {
@@ -67,6 +76,44 @@ async function saveMessage(conversationId, role, content) {
     .from("conversation_messages")
     .insert([{ conversation_id: conversationId, role, content }]);
   if (error) console.error("saveMessage error:", error);
+}
+
+/** ====== どの質問で検索するか（場所/最新/料金/営業時間など） ====== */
+const PLACE_HINTS = [
+  /どこ|場所|住所|地図|最寄り|近く|アクセス|電話|営業時間|定休日|何時まで/,
+  /カフェ|居酒屋|レストラン|病院|クリニック|ホテル|温泉|レンタカー|美術館|水族館|動物園|図書館|保育園|幼稚園|役所/,
+  /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|渋谷|新宿|池袋|銀座|梅田|難波|天神|博多|横浜/
+];
+const FACT_HINTS = [
+  /最新|今日|昨日|今週|今月|今年|速報|本日/,
+  /ニュース|発表|値上げ|値下げ|価格|料金|在庫|為替|金利|相場|スケジュール|日程|統計|人数|売上|利用者|シェア/,
+  /法律|規制|規約|仕様|バージョン/,
+];
+
+function needsSearch(userText) {
+  if (!userText) return false;
+  const t = userText.toLowerCase();
+  if (t.includes("検証モード")) return true;   // 手動強制
+  if (t.includes("オフライン")) return false; // 手動オフ
+  return [...PLACE_HINTS, ...FACT_HINTS].some(re => re.test(userText));
+}
+
+/** ====== SerpAPIでGoogle検索（簡易） ====== */
+async function webSearch(query, num = 5, gl = "jp", hl = "ja") {
+  if (!SERPAPI_KEY) return [];
+  const url =
+    `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(query)}&num=${num}&gl=${gl}&hl=${hl}&api_key=${SERPAPI_KEY}`;
+  try {
+    const r = await fetch(url);
+    const j = await r.json();
+    const items = j.organic_results || [];
+    return items
+      .filter(it => it.title && it.snippet && it.link)
+      .map(it => ({ title: it.title, snippet: it.snippet, link: it.link }));
+  } catch (e) {
+    console.error("webSearch error:", e);
+    return [];
+  }
 }
 
 /** ====== Health check ====== */
@@ -77,7 +124,7 @@ app.post("/callback", line.middleware(config), async (req, res) => {
   try {
     const events = req.body.events ?? [];
     await Promise.all(events.map(handleEvent));
-    return res.status(200).end(); // Verify用: 常に200
+    return res.status(200).end();
   } catch (e) {
     console.error("Webhook error:", e);
     return res.status(200).end();
@@ -91,43 +138,56 @@ async function handleEvent(event) {
   const userText = (event.message.text ?? "").trim();
   const conversationId = getConversationId(event);
 
-  // 「リセット」で会話履歴を削除（運用便利）
+  // 会話リセット
   if (userText === "リセット" || userText.toLowerCase() === "reset") {
     const { error } = await supabase
       .from("conversation_messages")
       .delete()
       .eq("conversation_id", conversationId);
     const msg = error
-      ? "リセットに失敗しました。少し時間をおいてお試しください。"
+      ? "履歴のリセットに失敗しました。少し時間をおいてお試しください。"
       : "会話履歴をリセットしました。改めてどうぞ！";
     await lineClient.replyMessage(event.replyToken, { type: "text", text: msg });
     return;
   }
 
-  // 入力を保存
+  // 入力保存
   await saveMessage(conversationId, "user", userText);
 
-  // 履歴を取得
+  // 直近履歴
   const history = await fetchRecentMessages(conversationId);
 
-  // ざっくり長さで絞る（簡易トークン節約）
-  const approxLimitChars = 7000;
-  let running = 0;
-  const trimmed = [];
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i];
-    running += (m.content?.length ?? 0);
-    trimmed.unshift(m);
-    if (running > approxLimitChars) {
-      trimmed.shift();
-      break;
+  // 必要なときだけ検索
+  let sources = [];
+  if (needsSearch(userText)) {
+    try {
+      // 検索クエリを少し整える（任意）
+      const qResp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.2,
+        max_tokens: 60,
+        messages: [
+          { role: "system", content: "日本語の質問から、Google検索に最適なクエリを20〜60文字で1行だけ出力。装飾なし。" },
+          { role: "user", content: userText }
+        ],
+      });
+      const bestQ = qResp.choices?.[0]?.message?.content?.trim() || userText;
+      sources = await webSearch(bestQ, 5, "jp", "ja");
+    } catch (e) {
+      console.error("query refine error:", e);
+      sources = await webSearch(userText, 5, "jp", "ja");
     }
   }
 
+  // sources を説明用に messages に添える（LLMはこれを根拠に自然文で回答）
+  const sourceBlock = sources.length
+    ? `\n\n[Sources]\n${sources.map((s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`).join("\n")}`
+    : "";
+
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...trimmed,
-    { role: "user", content: userText },
+    ...history,
+    { role: "user", content: userText + sourceBlock },
   ];
 
   let replyText = "…";
@@ -135,21 +195,28 @@ async function handleEvent(event) {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
-      max_tokens: 800,
-      temperature: 0.6, // 少しだけ表現を柔らかく
+      temperature: 0.5,       // 自然さ維持
+      max_tokens: 900,
     });
-    replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
+    let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+    // 検索をしたのにURLが一切ない場合は、簡易の出典欄を末尾に追記
+    if (sources.length && !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)) {
+      const cite = sources.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
+      draft += `\n\n出典:\n${cite}`;
+    }
+
+    replyText = draft;
   } catch (err) {
     console.error("OpenAI error:", err);
-    replyText =
-      "今ちょっと混み合っているみたいです。短めにもう一度聞いてもらえると助かります！";
+    replyText = "うまく調べられませんでした。店名やエリアをもう少しだけ具体的にいただけますか？";
   }
 
-  // 出力を保存
+  // 出力保存
   await saveMessage(conversationId, "assistant", replyText);
 
   // 返信
-  return lineClient.replyMessage(event.replyToken, {
+  await lineClient.replyMessage(event.replyToken, {
     type: "text",
     text: replyText,
   });
