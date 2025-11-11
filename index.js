@@ -78,33 +78,28 @@ async function saveMessage(conversationId, role, content) {
   if (error) console.error("saveMessage error:", error);
 }
 
-/** ====== 検索発火条件（場所/最新/料金/営業時間など） ====== */
+/** ====== 検索発火のためのヒント ====== */
+/* 場所系：※「どこ」は外す（誤判定の原因） */
 const PLACE_HINTS = [
-  /どこ|場所|住所|地図|最寄り|近く|周辺|近辺|アクセス|電話|営業時間|定休日|何時まで/,
+  /場所|住所|地図|最寄り|近く|周辺|近辺|アクセス|電話|営業時間|定休日|何時まで/,
   /カフェ|居酒屋|レストラン|病院|クリニック|ホテル|温泉|レンタカー|美術館|水族館|動物園|図書館|保育園|幼稚園|役所|コンビニ|ATM|コインランドリー/,
   /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|横浜|神戸|鎌倉|川崎|千葉|埼玉/,
   /渋谷|新宿|池袋|銀座|秋葉原|上野|品川|恵比寿|中目黒|自由が丘|下北沢|吉祥寺|梅田|難波|天王寺|心斎橋|三宮|元町|天神|博多/
 ];
+
+/* 事実系 */
 const FACT_HINTS = [
   /最新|今日|昨日|今週|今月|今年|速報|本日/,
   /ニュース|発表|値上げ|値下げ|価格|料金|在庫|為替|金利|相場|スケジュール|日程|統計|人数|売上|利用者|シェア/,
   /法律|規制|規約|仕様|バージョン/
 ];
 
-/** —— 商品/サービスの購入意図（オンライン優先） —— */
+/* 商品/サービス購入意図（オンライン優先） */
 const PRODUCT_BUY_HINTS = [
   /どこに売って(ます|る)|どこで(買え|売っ)て|どこで手に入る|どこで購入|買いたい|販売店|取扱店/,
   /通販|オンライン|ネットショップ|EC|公式ストア|公式サイト|購入先|在庫/,
-  /買える\?|売ってる\?/
+  /買える\?|売ってる\?/,
 ];
-
-function needsSearch(userText) {
-  if (!userText) return false;
-  const t = userText.toLowerCase();
-  if (t.includes("検証モード")) return true;    // 手動強制
-  if (t.includes("オフライン")) return false;  // 手動オフ
-  return [...PLACE_HINTS, ...FACT_HINTS, ...PRODUCT_BUY_HINTS].some(re => re.test(userText));
-}
 
 /** 地名・ランドマーク等が含まれているか簡易判定 */
 function hasPlaceWord(userText) {
@@ -116,16 +111,16 @@ function hasPlaceWord(userText) {
   ].some(re => re.test(userText));
 }
 
-/** 質問が「場所案内」系かを判定（商品購入意図と分離） */
-function isPlaceIntent(userText) {
-  if (!userText) return false;
-  return PLACE_HINTS.some(re => re.test(userText));
-}
-
-/** 質問が「商品/サービス購入」意図かを判定（オンライン優先） */
-function isProductIntent(userText) {
-  if (!userText) return false;
-  return PRODUCT_BUY_HINTS.some(re => re.test(userText));
+/** ====== 意図分類：優先度は「商品購入」→「場所」→「事実」 ====== */
+function classifyIntent(userText) {
+  if (!userText) return null;
+  // 1) 商品購入（オンライン案内を最優先）
+  if (PRODUCT_BUY_HINTS.some(re => re.test(userText))) return "product";
+  // 2) 場所（「どこ」は含めず、地名/施設/営業時間などで判断）
+  if (PLACE_HINTS.some(re => re.test(userText))) return "place";
+  // 3) 事実系
+  if (FACT_HINTS.some(re => re.test(userText))) return "fact";
+  return null;
 }
 
 /** ====== SerpAPIでGoogle検索 ====== */
@@ -187,31 +182,26 @@ async function handleEvent(event) {
   // 直近履歴
   const history = await fetchRecentMessages(conversationId);
 
+  // —— 意図分類（※優先度順で分岐）
+  const intent = classifyIntent(userText);
+
   /** ---------- 分岐ロジック ----------
-   * 1) 場所系だが地名なし → まず場所を聞く（即レス）
-   * 2) 商品/サービス購入の意図で地名なし → オンライン優先で検索＆案内（位置は聞かない）
-   * 3) それ以外 → 通常フロー（必要時検索）
+   * product：オンライン購入先を案内（位置は聞かない）
+   * place   ：地名なしなら「今どこ？」→ 地名ありなら検索
+   * fact    ：検索して根拠付きで回答
+   * null    ：通常LLM
    */
 
-  // 1) 場所意図 & 地名なし → 位置情報を尋ねる
-  if (isPlaceIntent(userText) && !hasPlaceWord(userText)) {
-    const reply = "了解！調べるね。今どこにいますか？";
-    await saveMessage(conversationId, "assistant", reply);
-    await lineClient.replyMessage(event.replyToken, { type: "text", text: reply });
-    return;
-  }
-
-  // 2) 商品/サービス購入意図 & 地名なし → オンライン優先で検索＆回答
-  if (isProductIntent(userText) && !hasPlaceWord(userText)) {
+  // product：オンライン優先
+  if (intent === "product") {
     let sources = [];
     try {
-      // 検索クエリを「通販/公式/オンライン」を意識して最適化
       const qResp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         temperature: 0.2,
         max_tokens: 60,
         messages: [
-          { role: "system", content: "ユーザー質問から、オンライン購入先を探すGoogle検索クエリを20〜60文字で1行。語尾や装飾なし。キーワードに『通販 公式 価格』を含める。" },
+          { role: "system", content: "ユーザー質問から、オンライン購入先を探すGoogle検索クエリを20〜60文字で1行。語尾や装飾なし。『通販 公式 価格』を含める。" },
           { role: "user", content: userText }
         ],
       });
@@ -229,7 +219,7 @@ async function handleEvent(event) {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: `${userText}\n\n（方針：まずオンラインの購入先を優先して紹介。必要なら近隣店舗も案内可と一言添える）${sourceBlock}` },
+      { role: "user", content: `${userText}\n\n（方針：まずオンラインの購入先を優先して紹介。必要なら近隣店舗も案内できると一言添える）${sourceBlock}` },
     ];
 
     let replyText = "…";
@@ -242,15 +232,12 @@ async function handleEvent(event) {
       });
       let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
 
-      // URLがなければ出典を補完
       if (sources.length && !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)) {
         const cite = sources.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
         draft += `\n\n出典:\n${cite}`;
       }
 
-      // ひとこと補足（ローカル店が必要なら地名/位置を依頼）
       draft += `\n\n※近くの実店舗が良ければ、地名か位置情報を教えてください。周辺の取扱店も探せます。`;
-
       replyText = draft;
     } catch (err) {
       console.error("OpenAI error (product):", err);
@@ -262,9 +249,71 @@ async function handleEvent(event) {
     return;
   }
 
-  // 3) 通常フロー（必要時のみ検索）
-  let sources = [];
-  if (needsSearch(userText)) {
+  // place：地名なし→場所を聞く / 地名あり→検索
+  if (intent === "place") {
+    if (!hasPlaceWord(userText)) {
+      const reply = "了解！調べるね。今どこにいますか？";
+      await saveMessage(conversationId, "assistant", reply);
+      await lineClient.replyMessage(event.replyToken, { type: "text", text: reply });
+      return;
+    }
+    // 地名あり → 検索
+    let sources = [];
+    try {
+      const qResp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0.2,
+        max_tokens: 60,
+        messages: [
+          { role: "system", content: "日本語の質問から、場所検索向けのGoogleクエリを20〜60文字で1行だけ出力。装飾なし。" },
+          { role: "user", content: userText }
+        ],
+      });
+      const bestQ = qResp.choices?.[0]?.message?.content?.trim() || userText;
+      sources = await webSearch(bestQ, 6, "jp", "ja");
+    } catch (e) {
+      console.error("query refine (place) error:", e);
+      sources = await webSearch(userText, 6, "jp", "ja");
+    }
+
+    const sourceBlock = sources.length
+      ? `\n\n[Sources]\n${sources.map((s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`).join("\n")}`
+      : "";
+
+    const messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+      { role: "user", content: userText + sourceBlock },
+    ];
+
+    let replyText = "…";
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        temperature: 0.5,
+        max_tokens: 900,
+      });
+      let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+      if (sources.length && !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)) {
+        const cite = sources.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
+        draft += `\n\n出典:\n${cite}`;
+      }
+      replyText = draft;
+    } catch (err) {
+      console.error("OpenAI error (place):", err);
+      replyText = "うまく調べられませんでした。地名や範囲をもう少しだけ具体的にいただけますか？";
+    }
+
+    await saveMessage(conversationId, "assistant", replyText);
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
+    return;
+  }
+
+  // fact：事実系は検索して根拠付きで回答
+  if (intent === "fact") {
+    let sources = [];
     try {
       const qResp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -278,19 +327,49 @@ async function handleEvent(event) {
       const bestQ = qResp.choices?.[0]?.message?.content?.trim() || userText;
       sources = await webSearch(bestQ, 6, "jp", "ja");
     } catch (e) {
-      console.error("query refine error:", e);
+      console.error("query refine (fact) error:", e);
       sources = await webSearch(userText, 6, "jp", "ja");
     }
+
+    const sourceBlock = sources.length
+      ? `\n\n[Sources]\n${sources.map((s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`).join("\n")}`
+      : "";
+
+    const messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+      { role: "user", content: userText + sourceBlock },
+    ];
+
+    let replyText = "…";
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages,
+        temperature: 0.5,
+        max_tokens: 900,
+      });
+      let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
+      if (sources.length && !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)) {
+        const cite = sources.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
+        draft += `\n\n出典:\n${cite}`;
+      }
+      replyText = draft;
+    } catch (err) {
+      console.error("OpenAI error (fact):", err);
+      replyText = "うまく調べられませんでした。条件をもう少しだけ具体的にいただけますか？";
+    }
+
+    await saveMessage(conversationId, "assistant", replyText);
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
+    return;
   }
 
-  const sourceBlock = sources.length
-    ? `\n\n[Sources]\n${sources.map((s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`).join("\n")}`
-    : "";
-
+  // null：通常フロー（検索不要）
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     ...history,
-    { role: "user", content: userText + sourceBlock },
+    { role: "user", content: userText },
   ];
 
   let replyText = "…";
@@ -298,28 +377,17 @@ async function handleEvent(event) {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
-      temperature: 0.5,       // 自然さ維持
+      temperature: 0.5,
       max_tokens: 900,
     });
-    let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
-
-    if (sources.length && !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)) {
-      const cite = sources.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
-      draft += `\n\n出典:\n${cite}`;
-    }
-
-    replyText = draft;
+    replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
   } catch (err) {
     console.error("OpenAI error:", err);
-    replyText = "うまく調べられませんでした。条件をもう少しだけ具体的にいただけますか？";
+    replyText = "少し混み合っています。言い回しを変えてもう一度だけ送ってみてもらえますか？";
   }
 
   await saveMessage(conversationId, "assistant", replyText);
-
-  await lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: replyText,
-  });
+  await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
 }
 
 /** ====== 起動 ====== */
