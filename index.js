@@ -19,29 +19,19 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-/** ====== System Prompt ====== */
+/** ====== 親しみやすい SYSTEM_PROMPT ====== */
 const SYSTEM_PROMPT = `
-あなたは「AIくん」です。
-回答は必ず日本語で、わかりやすく・具体的に返してください。
+あなたは「AIくん」です。相手に寄りそい、親しみやすい口調で、自然な日本語の文章で答えてください。
+箇条書きは必要に応じて軽く使ってOKですが、毎回同じ形式にはしないでください。
+提案の根拠や具体例は簡潔に。必要なら追加の質問を1つだけ添えて会話を広げてください。
 
-【禁止事項】
-- 「公式サイトを確認してください」
-- 「難しいです／わかりません」
-- 「私のデータには含まれていません」
-- 一般論だけで終わること
-
-【不足情報の扱い】
-- 情報が足りない場合、最大2つ質問する
-- ただし、可能性の高い候補を同時に提示する
-
-【回答フォーマット】
-1) 要点1行
-2) 具体候補 最大3件（名称 / 所在地 / URL / 価格目安など）
-3) 代替案
-4) 次の一手（1行）
+【避けること】
+- 「公式サイトを確認してください」だけで終わる
+- 「わかりません」で終わる
+- 一般論だけで終える
 `;
 
-/** ====== 会話ID生成 ====== */
+/** ====== 会話ID（1:1/グループ/ルーム対応） ====== */
 function getConversationId(event) {
   const src = event.source ?? {};
   if (src.groupId) return `group:${src.groupId}`;
@@ -51,7 +41,7 @@ function getConversationId(event) {
 }
 
 /** ====== 履歴保存/取得 ====== */
-const HISTORY_LIMIT = 12; // 直近のメッセージ数
+const HISTORY_LIMIT = 12; // 直近の user/assistant を取り回し（6往復イメージ）
 
 async function fetchRecentMessages(conversationId) {
   const { data, error } = await supabase
@@ -66,16 +56,16 @@ async function fetchRecentMessages(conversationId) {
     return [];
   }
 
-  return (data ?? []).reverse() // 古い順
-    .map(r => ({ role: r.role, content: r.content }))
-    .filter(m => m.role === "user" || m.role === "assistant");
+  return (data ?? [])
+    .reverse() // 古→新
+    .map((r) => ({ role: r.role, content: r.content }))
+    .filter((m) => m.role === "user" || m.role === "assistant");
 }
 
 async function saveMessage(conversationId, role, content) {
   const { error } = await supabase
     .from("conversation_messages")
     .insert([{ conversation_id: conversationId, role, content }]);
-
   if (error) console.error("saveMessage error:", error);
 }
 
@@ -87,7 +77,7 @@ app.post("/callback", line.middleware(config), async (req, res) => {
   try {
     const events = req.body.events ?? [];
     await Promise.all(events.map(handleEvent));
-    return res.status(200).end(); // Verify用: 200必須
+    return res.status(200).end(); // Verify用: 常に200
   } catch (e) {
     console.error("Webhook error:", e);
     return res.status(200).end();
@@ -101,34 +91,61 @@ async function handleEvent(event) {
   const userText = (event.message.text ?? "").trim();
   const conversationId = getConversationId(event);
 
+  // 「リセット」で会話履歴を削除（運用便利）
+  if (userText === "リセット" || userText.toLowerCase() === "reset") {
+    const { error } = await supabase
+      .from("conversation_messages")
+      .delete()
+      .eq("conversation_id", conversationId);
+    const msg = error
+      ? "リセットに失敗しました。少し時間をおいてお試しください。"
+      : "会話履歴をリセットしました。改めてどうぞ！";
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: msg });
+    return;
+  }
+
   // 入力を保存
   await saveMessage(conversationId, "user", userText);
 
   // 履歴を取得
   const history = await fetchRecentMessages(conversationId);
 
+  // ざっくり長さで絞る（簡易トークン節約）
+  const approxLimitChars = 7000;
+  let running = 0;
+  const trimmed = [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    running += (m.content?.length ?? 0);
+    trimmed.unshift(m);
+    if (running > approxLimitChars) {
+      trimmed.shift();
+      break;
+    }
+  }
+
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...history,
+    ...trimmed,
     { role: "user", content: userText },
   ];
 
   let replyText = "…";
-
   try {
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages,
       max_tokens: 800,
-      temperature: 0.5,
+      temperature: 0.6, // 少しだけ表現を柔らかく
     });
     replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
   } catch (err) {
     console.error("OpenAI error:", err);
-    replyText = "すみません、少し混み合っています。もう一度お試しください。";
+    replyText =
+      "今ちょっと混み合っているみたいです。短めにもう一度聞いてもらえると助かります！";
   }
 
-  // 出力も保存
+  // 出力を保存
   await saveMessage(conversationId, "assistant", replyText);
 
   // 返信
