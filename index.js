@@ -22,22 +22,17 @@ const supabase = createClient(
 /** ====== SerpAPI（Google検索の簡易導入） ====== */
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
+/** ====== SNS 検索の鮮度（日数） ====== */
+const RECENCY_DAYS = Math.max(
+  1,
+  parseInt(process.env.SOCIAL_SEARCH_RECENCY_DAYS || "14", 10)
+);
+
 /** ====== 親しみ＋正確性重視 SYSTEM_PROMPT ====== */
 const SYSTEM_PROMPT = `
-あなたは「AIくん」です。相手に寄りそい、親しみやすい口調で、自然な日本語の文章で答えてください。
-箇条書きは必要に応じて軽く使ってOKですが、毎回同じ形式にはしないでください。
-提案の根拠や具体例は簡潔に。必要なら追加の質問を1つだけ添えて会話を広げてください。
-
-【正確性のルール】
-- 日付、統計、制度、料金、人数、最新情報、店舗・施設の住所/営業時間など事実依存の内容は、
-  可能であれば渡された sources を参考にしてください。
-- sources が十分でない場合は断定せず、「可能性」「要確認」と表現してください。
-
-【避けること】
-- 「公式サイトを確認してください」だけで終わる
-- 「わかりません」で終わる
-- 一般論だけで終える
-- sources があるのに無視する
+あなたは「AIくん」です。親しみやすい自然な日本語で答えます。
+sources があれば事実はそれを根拠にし、リンクも示します。
+sources が乏しい時は「可能性」「要確認」など控えめに表現し、追加確認を促します。
 `;
 
 /** ====== 会話ID ====== */
@@ -78,30 +73,89 @@ async function saveMessage(conversationId, role, content) {
   if (error) console.error("saveMessage error:", error);
 }
 
-/** ====== 検索発火のためのヒント ====== */
-/* 場所系：※「どこ」は外す（誤判定の原因） */
+/** ====== ユーティリティ ====== */
+function daysToTbs(days) {
+  // Googleの期間フィルタ tbs=qdr:d / w / m
+  if (days <= 7) return "qdr:w";          // 1週間以内
+  if (days <= 31) return "qdr:m";         // 1ヶ月以内
+  return "qdr:y";                          // 1年以内（保険）
+}
+
+/** ====== SerpAPI で検索（期間など追加パラメタ対応） ====== */
+async function webSearch(query, opts = {}) {
+  if (!SERPAPI_KEY) return [];
+  const {
+    num = 6, gl = "jp", hl = "ja", tbs // tbs=期間フィルタ
+  } = opts;
+  const params = new URLSearchParams({
+    engine: "google",
+    q: query,
+    num: String(num),
+    gl, hl,
+    api_key: SERPAPI_KEY,
+  });
+  if (tbs) params.set("tbs", tbs);
+
+  const url = `https://serpapi.com/search.json?${params.toString()}`;
+  try {
+    const r = await fetch(url);
+    const j = await r.json();
+    const items = j.organic_results || [];
+    return items
+      .filter((it) => it.title && it.link)
+      .map((it) => ({
+        title: it.title,
+        snippet: it.snippet || "",
+        link: it.link,
+      }));
+  } catch (e) {
+    console.error("webSearch error:", e);
+    return [];
+  }
+}
+
+/** ====== SNS横断（X/Instagram/Reddit） ====== */
+async function socialSearchAll(userText) {
+  if (!SERPAPI_KEY) return [];
+  const tbs = daysToTbs(RECENCY_DAYS);
+  // X(旧Twitter) は x.com も twitter.com も拾う
+  const siteQuery =
+    '(site:x.com OR site:twitter.com) OR site:instagram.com OR site:reddit.com';
+  const q = `${userText} ${siteQuery}`;
+  const results = await webSearch(q, { num: 8, tbs, gl: "jp", hl: "ja" });
+
+  // 似たURLの重複を軽く排除
+  const seen = new Set();
+  const dedup = [];
+  for (const r of results) {
+    const key = r.link.replace(/(\?.*)$/, "");
+    if (!seen.has(key)) {
+      seen.add(key);
+      dedup.push(r);
+    }
+    if (dedup.length >= 8) break;
+  }
+  return dedup;
+}
+
+/** ====== 検索ヒントの簡易ルール ====== */
 const PLACE_HINTS = [
   /場所|住所|地図|最寄り|近く|周辺|近辺|アクセス|電話|営業時間|定休日|何時まで/,
   /カフェ|居酒屋|レストラン|病院|クリニック|ホテル|温泉|レンタカー|美術館|水族館|動物園|図書館|保育園|幼稚園|役所|コンビニ|ATM|コインランドリー/,
   /東京|東京都|大阪|京都|札幌|仙台|名古屋|福岡|那覇|横浜|神戸|鎌倉|川崎|千葉|埼玉/,
   /渋谷|新宿|池袋|銀座|秋葉原|上野|品川|恵比寿|中目黒|自由が丘|下北沢|吉祥寺|梅田|難波|天王寺|心斎橋|三宮|元町|天神|博多/
 ];
-
-/* 事実系 */
 const FACT_HINTS = [
   /最新|今日|昨日|今週|今月|今年|速報|本日/,
   /ニュース|発表|値上げ|値下げ|価格|料金|在庫|為替|金利|相場|スケジュール|日程|統計|人数|売上|利用者|シェア/,
   /法律|規制|規約|仕様|バージョン/
 ];
-
-/* 商品/サービス購入意図（オンライン優先） */
 const PRODUCT_BUY_HINTS = [
   /どこに売って(ます|る)|どこで(買え|売っ)て|どこで手に入る|どこで購入|買いたい|販売店|取扱店/,
   /通販|オンライン|ネットショップ|EC|公式ストア|公式サイト|購入先|在庫/,
   /買える\?|売ってる\?/,
 ];
 
-/** 地名・ランドマーク等が含まれているか簡易判定 */
 function hasPlaceWord(userText) {
   if (!userText) return false;
   return [
@@ -111,35 +165,12 @@ function hasPlaceWord(userText) {
   ].some((re) => re.test(userText));
 }
 
-/** ====== 意図分類：優先度は「商品購入」→「場所」→「事実」 ====== */
 function classifyIntent(userText) {
   if (!userText) return null;
-  // 1) 商品購入（オンライン案内を最優先）
   if (PRODUCT_BUY_HINTS.some((re) => re.test(userText))) return "product";
-  // 2) 場所（「どこ」は含めず、地名/施設/営業時間などで判断）
   if (PLACE_HINTS.some((re) => re.test(userText))) return "place";
-  // 3) 事実系
   if (FACT_HINTS.some((re) => re.test(userText))) return "fact";
   return null;
-}
-
-/** ====== SerpAPIでGoogle検索 ====== */
-async function webSearch(query, num = 6, gl = "jp", hl = "ja") {
-  if (!SERPAPI_KEY) return [];
-  const url = `https://serpapi.com/search.json?engine=google&q=${encodeURIComponent(
-    query
-  )}&num=${num}&gl=${gl}&hl=${hl}&api_key=${SERPAPI_KEY}`;
-  try {
-    const r = await fetch(url);
-    const j = await r.json();
-    const items = j.organic_results || [];
-    return items
-      .filter((it) => it.title && it.snippet && it.link)
-      .map((it) => ({ title: it.title, snippet: it.snippet, link: it.link }));
-  } catch (e) {
-    console.error("webSearch error:", e);
-    return [];
-  }
 }
 
 /** ====== Health check ====== */
@@ -156,6 +187,13 @@ app.post("/callback", line.middleware(config), async (req, res) => {
     return res.status(200).end();
   }
 });
+
+/** ====== 共通：sources をテキスト化 ====== */
+function renderSources(title, arr) {
+  if (!arr?.length) return "";
+  const lines = arr.slice(0, 6).map((s, i) => `(${i + 1}) ${s.title}\n${s.link}`);
+  return `\n\n[${title}]\n${lines.join("\n")}`;
+}
 
 /** ====== メイン処理 ====== */
 async function handleEvent(event) {
@@ -183,15 +221,15 @@ async function handleEvent(event) {
   // 直近履歴
   const history = await fetchRecentMessages(conversationId);
 
-  // —— 意図分類（※優先度順で分岐）
   const intent = classifyIntent(userText);
 
-  /** ---------- 分岐ロジック ----------
-   * product：オンライン購入先を案内（位置は聞かない）
-   * place   ：地名なしなら「今どこ？」→ 地名ありなら検索
-   * fact    ：検索して根拠付きで回答
-   * null    ：通常LLM
-   */
+  /** ---------- 共通：SNSも常に検索 ---------- */
+  let social = [];
+  try {
+    social = await socialSearchAll(userText);
+  } catch (e) {
+    console.error("socialSearch error:", e);
+  }
 
   // product：オンライン優先
   if (intent === "product") {
@@ -202,38 +240,23 @@ async function handleEvent(event) {
         temperature: 0.2,
         max_tokens: 60,
         messages: [
-          {
-            role: "system",
-            content:
-              "ユーザー質問から、オンライン購入先を探すGoogle検索クエリを20〜60文字で1行。語尾や装飾なし。『通販 公式 価格』を含める。",
-          },
-          { role: "user", content: userText },
+          { role: "system", content: "ユーザー質問から、オンライン購入先を探すGoogle検索クエリを20〜60文字で1行。語尾や装飾なし。『通販 公式 価格』を含める。" },
+          { role: "user", content: userText }
         ],
       });
-      const bestQ =
-        qResp.choices?.[0]?.message?.content?.trim() ||
-        userText + " 通販 公式 価格";
-      sources = await webSearch(bestQ, 6, "jp", "ja");
+      const bestQ = (qResp.choices?.[0]?.message?.content?.trim() || (userText + " 通販 公式 価格"));
+      sources = await webSearch(bestQ, { num: 6, gl: "jp", hl: "ja" });
     } catch (e) {
       console.error("query refine (product) error:", e);
-      sources = await webSearch(userText + " 通販 公式 価格", 6, "jp", "ja");
+      sources = await webSearch(userText + " 通販 公式 価格", { num: 6, gl: "jp", hl: "ja" });
     }
 
-    const sourceBlock = sources.length
-      ? `\n\n[Sources]\n${sources
-          .map(
-            (s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`
-          )
-          .join("\n")}`
-      : "";
+    const sourceBlock = renderSources("Web sources", sources) + renderSources(`SNS（直近${RECENCY_DAYS}日）`, social);
 
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      {
-        role: "user",
-        content: `${userText}\n\n（方針：まずオンラインの購入先を優先して紹介。必要なら近隣店舗も案内できると一言添える）${sourceBlock}`,
-      },
+      { role: "user", content: `${userText}\n\n（方針：まずオンライン購入先を優先。入荷/在庫/評判はSNSを根拠に付記）${sourceBlock}` },
     ];
 
     let replyText = "…";
@@ -244,47 +267,25 @@ async function handleEvent(event) {
         temperature: 0.5,
         max_tokens: 900,
       });
-      let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
-
-      if (
-        sources.length &&
-        !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)
-      ) {
-        const cite = sources
-          .slice(0, 3)
-          .map((s, i) => `(${i + 1}) ${s.link}`)
-          .join("\n");
-        draft += `\n\n出典:\n${cite}`;
-      }
-
-      draft += `\n\n※近くの実店舗が良ければ、地名か位置情報を教えてください。周辺の取扱店も探せます。`;
-      replyText = draft;
+      replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
     } catch (err) {
       console.error("OpenAI error (product):", err);
-      replyText =
-        "うまく調べられませんでした。商品名や型番をもう少しだけ具体的に教えてもらえますか？";
+      replyText = "うまく調べられませんでした。商品名や型番をもう少しだけ具体的に教えてもらえますか？";
     }
 
     await saveMessage(conversationId, "assistant", replyText);
-    await lineClient.replyMessage(event.replyToken, {
-      type: "text",
-      text: replyText,
-    });
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
     return;
   }
 
   // place：地名なし→場所を聞く / 地名あり→検索
   if (intent === "place") {
     if (!hasPlaceWord(userText)) {
-      const reply = "了解！調べるね。今どこにいますか？";
+      const reply = "了解！調べるね。今どこにいますか？（地名や最寄り駅があると、周辺の最新投稿も合わせて探せます）";
       await saveMessage(conversationId, "assistant", reply);
-      await lineClient.replyMessage(event.replyToken, {
-        type: "text",
-        text: reply,
-      });
+      await lineClient.replyMessage(event.replyToken, { type: "text", text: reply });
       return;
     }
-    // 地名あり → 検索
     let sources = [];
     try {
       const qResp = await openai.chat.completions.create({
@@ -292,33 +293,23 @@ async function handleEvent(event) {
         temperature: 0.2,
         max_tokens: 60,
         messages: [
-          {
-            role: "system",
-            content:
-              "日本語の質問から、場所検索向けのGoogleクエリを20〜60文字で1行だけ出力。装飾なし。",
-          },
-          { role: "user", content: userText },
+          { role: "system", content: "日本語の質問から、場所検索向けのGoogleクエリを20〜60文字で1行だけ出力。装飾なし。" },
+          { role: "user", content: userText }
         ],
       });
       const bestQ = qResp.choices?.[0]?.message?.content?.trim() || userText;
-      sources = await webSearch(bestQ, 6, "jp", "ja");
+      sources = await webSearch(bestQ, { num: 6, gl: "jp", hl: "ja" });
     } catch (e) {
       console.error("query refine (place) error:", e);
-      sources = await webSearch(userText, 6, "jp", "ja");
+      sources = await webSearch(userText, { num: 6, gl: "jp", hl: "ja" });
     }
 
-    const sourceBlock = sources.length
-      ? `\n\n[Sources]\n${sources
-          .map(
-            (s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`
-          )
-          .join("\n")}`
-      : "";
+    const sourceBlock = renderSources("Web sources", sources) + renderSources(`SNS（直近${RECENCY_DAYS}日）`, social);
 
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: userText + sourceBlock },
+      { role: "user", content: `${userText}${sourceBlock}` },
     ];
 
     let replyText = "…";
@@ -329,34 +320,18 @@ async function handleEvent(event) {
         temperature: 0.5,
         max_tokens: 900,
       });
-      let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
-
-      if (
-        sources.length &&
-        !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)
-      ) {
-        const cite = sources
-          .slice(0, 3)
-          .map((s, i) => `(${i + 1}) ${s.link}`)
-          .join("\n");
-        draft += `\n\n出典:\n${cite}`;
-      }
-      replyText = draft;
+      replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
     } catch (err) {
       console.error("OpenAI error (place):", err);
-      replyText =
-        "うまく調べられませんでした。地名や範囲をもう少しだけ具体的にいただけますか？";
+      replyText = "うまく調べられませんでした。地名や範囲をもう少しだけ具体的にいただけますか？";
     }
 
     await saveMessage(conversationId, "assistant", replyText);
-    await lineClient.replyMessage(event.replyToken, {
-      type: "text",
-      text: replyText,
-    });
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
     return;
   }
 
-  // fact：事実系は検索して根拠付きで回答
+  // fact：事実系は検索して根拠付きで回答（SNSも根拠に）
   if (intent === "fact") {
     let sources = [];
     try {
@@ -365,33 +340,23 @@ async function handleEvent(event) {
         temperature: 0.2,
         max_tokens: 60,
         messages: [
-          {
-            role: "system",
-            content:
-              "日本語の質問から、Google検索に最適なクエリを20〜60文字で1行だけ出力。装飾なし。",
-          },
-          { role: "user", content: userText },
+          { role: "system", content: "日本語の質問から、Google検索に最適なクエリを20〜60文字で1行だけ出力。装飾なし。" },
+          { role: "user", content: userText }
         ],
       });
       const bestQ = qResp.choices?.[0]?.message?.content?.trim() || userText;
-      sources = await webSearch(bestQ, 6, "jp", "ja");
+      sources = await webSearch(bestQ, { num: 6, gl: "jp", hl: "ja" });
     } catch (e) {
       console.error("query refine (fact) error:", e);
-      sources = await webSearch(userText, 6, "jp", "ja");
+      sources = await webSearch(userText, { num: 6, gl: "jp", hl: "ja" });
     }
 
-    const sourceBlock = sources.length
-      ? `\n\n[Sources]\n${sources
-          .map(
-            (s, i) => `(${i + 1}) ${s.title}\n${s.snippet}\n${s.link}`
-          )
-          .join("\n")}`
-      : "";
+    const sourceBlock = renderSources("Web sources", sources) + renderSources(`SNS（直近${RECENCY_DAYS}日）`, social);
 
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      { role: "user", content: userText + sourceBlock },
+      { role: "user", content: `${userText}${sourceBlock}` },
     ];
 
     let replyText = "…";
@@ -402,37 +367,22 @@ async function handleEvent(event) {
         temperature: 0.5,
         max_tokens: 900,
       });
-      let draft = resp.choices?.[0]?.message?.content?.trim() || "…";
-      if (
-        sources.length &&
-        !/(https?:\/\/[^\s)]+)|（https?:\/\/[^\s)]+）/.test(draft)
-      ) {
-        const cite = sources
-          .slice(0, 3)
-          .map((s, i) => `(${i + 1}) ${s.link}`)
-          .join("\n");
-        draft += `\n\n出典:\n${cite}`;
-      }
-      replyText = draft;
+      replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
     } catch (err) {
       console.error("OpenAI error (fact):", err);
-      replyText =
-        "うまく調べられませんでした。条件をもう少しだけ具体的にいただけますか？";
+      replyText = "うまく調べられませんでした。条件をもう少しだけ具体的にいただけますか？";
     }
 
     await saveMessage(conversationId, "assistant", replyText);
-    await lineClient.replyMessage(event.replyToken, {
-      type: "text",
-      text: replyText,
-    });
+    await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
     return;
   }
 
-  // null：通常フロー（検索不要）
+  // null：通常フロー（検索不要だがSNSは常に付ける）
   const messages = [
     { role: "system", content: SYSTEM_PROMPT },
     ...history,
-    { role: "user", content: userText },
+    { role: "user", content: `${userText}${renderSources(`SNS（直近${RECENCY_DAYS}日）`, social)}` },
   ];
 
   let replyText = "…";
@@ -446,15 +396,11 @@ async function handleEvent(event) {
     replyText = resp.choices?.[0]?.message?.content?.trim() || "…";
   } catch (err) {
     console.error("OpenAI error:", err);
-    replyText =
-      "少し混み合っています。言い回しを変えてもう一度だけ送ってみてもらえますか？";
+    replyText = "少し混み合っています。言い回しを変えてもう一度だけ送ってみてもらえますか？";
   }
 
   await saveMessage(conversationId, "assistant", replyText);
-  await lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: replyText,
-  });
+  await lineClient.replyMessage(event.replyToken, { type: "text", text: replyText });
 }
 
 /** ====== 起動 ====== */
