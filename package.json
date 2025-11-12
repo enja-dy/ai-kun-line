@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": ">=18.18"
+  },
   "scripts": {
     "start": "node index.js"
   },
@@ -13,4 +16,3 @@
     "@supabase/supabase-js": "^2.39.3"
   }
 }
-
