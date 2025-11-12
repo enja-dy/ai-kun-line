@@ -1,4 +1,4 @@
-// index.js — B案: まず場所を聞く → その後に詳細回答
+// index.js — 見出しなし＆会話優先版（B案：まず場所を聞く）
 import express from "express";
 import * as line from "@line/bot-sdk";
 import OpenAI from "openai";
@@ -29,12 +29,15 @@ const RECENCY_DAYS = Math.max(
   parseInt(process.env.SOCIAL_SEARCH_RECENCY_DAYS || "14", 10)
 );
 
-/* ========= SYSTEM PROMPT ========= */
+/* ========= SYSTEM PROMPT（見出し禁止・会話優先） ========= */
 const SYSTEM_PROMPT = `
-あなたは「AIくん」です。親しみやすい自然な日本語で、
-ユーザーの質問に「①結論 → ②具体 → ③最新SNS/WEB → ④代案 → ⑤次の一手」
-の順で簡潔・実用的に答えます。固有名詞をできるだけ入れてください。
-sources が薄い時は「可能性」「未確認」など控えめに。追加質問は1つだけ。
+あなたは「AIくん」です。丁寧で親しみやすい自然な日本語で話します。
+- 日常の雑談や相談は、そのまま会話。余計な見出しや構造は出さない。
+- 調査が必要な質問（場所/最新情報/価格/在庫/比較/レビュー/動画探し 等）のときだけ、
+  裏で取得したSNS/WEBの要点を自然な文章に織り交ぜる（出典URLを末尾に数件だけ添えるのは可）。
+- 固有名詞はできるだけ使う。確度が低いときは「可能性」「未確認」と表現。
+- 必要なときだけ最後に質問は1つだけ添える。
+- 箇条書きは短く、見出しや番号タイトル（①〜⑤ など）は **絶対に出さない**。
 `;
 
 /* ========= Conversation ID ========= */
@@ -46,7 +49,7 @@ function getConversationId(event) {
   return "unknown";
 }
 
-/* ========= DB: HISTORY ========= */
+/* ========= DB ========= */
 const HISTORY_LIMIT = 12;
 
 async function fetchRecentMessages(conversationId) {
@@ -71,8 +74,8 @@ async function saveMessage(conversationId, role, content) {
 
 /* ========= Google Search via SerpAPI ========= */
 function daysToTbs(days) {
-  if (days <= 7) return "qdr:w";  // 1 week
-  if (days <= 31) return "qdr:m"; // 1 month
+  if (days <= 7) return "qdr:w";
+  if (days <= 31) return "qdr:m";
   return "qdr:y";
 }
 
@@ -96,11 +99,7 @@ async function webSearch(query, opts = {}) {
     const items = j.organic_results || [];
     return items
       .filter((it) => it.title && it.link)
-      .map((it) => ({
-        title: it.title,
-        snippet: it.snippet || "",
-        link: it.link,
-      }));
+      .map((it) => ({ title: it.title, snippet: it.snippet || "", link: it.link }));
   } catch {
     return [];
   }
@@ -128,18 +127,17 @@ async function socialSearch(queryText) {
 }
 
 /* ========= Sources → text ========= */
-function renderSources(title, arr) {
+function renderSources(arr) {
   if (!arr?.length) return "";
-  const lines = arr
-    .slice(0, 6)
-    .map((s, i) => `(${i + 1}) ${s.title}\n${s.link}`)
-    .join("\n");
-  return `\n\n[${title}]\n${lines}`;
+  const lines = arr.slice(0, 3).map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
+  return `\n\n出典:\n${lines}`;
 }
 
 /* ========= Intent & Location ========= */
-const PREFS = "北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|東京都|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄";
-const BIG_CITIES = "札幌|仙台|東京|渋谷|新宿|池袋|横浜|川崎|千葉|大宮|名古屋|京都|大阪|梅田|難波|天王寺|神戸|三宮|博多|天神|福岡|那覇|鎌倉|吉祥寺|中目黒|下北沢";
+const PREFS =
+  "北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|東京都|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄";
+const BIG_CITIES =
+  "札幌|仙台|東京|渋谷|新宿|池袋|横浜|川崎|千葉|大宮|名古屋|京都|大阪|梅田|難波|天王寺|神戸|三宮|博多|天神|福岡|那覇|鎌倉|吉祥寺|中目黒|下北沢";
 
 function classifyIntent(text) {
   const t = text || "";
@@ -154,22 +152,27 @@ function hasLocationHint(text) {
   const re2 = new RegExp(`(${BIG_CITIES})`);
   if (re1.test(t) || re2.test(t)) return true;
   if (/駅/.test(t)) return true;
-  // 単語が短くても「渋谷」「原宿」等は上のBIG_CITIESで取れる
   return false;
 }
 
-/* 前回が「今どこに？」で、その直前のユーザー質問を取り出す */
+/* ========= “調査が要るか” の判定 ========= */
+function needsResearch(text) {
+  const t = (text || "").toLowerCase();
+  const cues = [
+    "最新", "速報", "値段", "価格", "在庫", "比較", "レビュー", "評判", "動画",
+    "探して", "売ってる", "買える", "どこ", "営業時間", "住所", "アクセス",
+    "いつから", "変更", "アップデート", "公式", "発表", "ニュース"
+  ];
+  return cues.some((kw) => t.includes(kw));
+}
+
+/* ========= 直前の「今どこ？」検知 & 基点質問取得 ========= */
 function getPendingPlaceQuery(history) {
-  // 履歴末尾から見て「assistant: 今どこにいますか？」があれば
-  // その直前の user 発話を基点クエリとして返す
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
     if (m.role === "assistant" && /今どこにいますか？/.test(m.content)) {
-      // さらに前を探す
       for (let j = i - 1; j >= 0; j--) {
-        if (history[j].role === "user") {
-          return history[j].content.trim();
-        }
+        if (history[j].role === "user") return history[j].content.trim();
       }
       break;
     }
@@ -201,10 +204,7 @@ async function handleEvent(event) {
 
   // reset
   if (userText === "リセット" || userText.toLowerCase() === "reset") {
-    await supabase
-      .from("conversation_messages")
-      .delete()
-      .eq("conversation_id", conversationId);
+    await supabase.from("conversation_messages").delete().eq("conversation_id", conversationId);
     await lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: "会話履歴をリセットしました。どうぞ！",
@@ -215,11 +215,10 @@ async function handleEvent(event) {
   await saveMessage(conversationId, "user", userText);
   const history = await fetchRecentMessages(conversationId);
 
-  // --- B案：まず場所を聞く ---
+  // —— B案：まず場所を聞く（地名なし）
   const intent = classifyIntent(userText);
   const locationInText = hasLocationHint(userText);
 
-  // 1) 「場所系」かつ「地名なし」→ 以前の定型を返して終了
   if (intent === "place" && !locationInText) {
     const reply = "了解！調べるね。今どこにいますか？（市区町村や最寄り駅でもOK）";
     await saveMessage(conversationId, "assistant", reply);
@@ -227,68 +226,79 @@ async function handleEvent(event) {
     return;
   }
 
-  // 2) 位置だけ来たっぽい場合（例：「渋谷」）→ 直前の質問内容を補完
+  // 位置だけ来た（例：「渋谷」）→ 直前質問を補完
   let baseQuery = null;
   if (locationInText && !/どこ|周辺|近く|アクセス|住所|地図|営業時間/.test(userText)) {
-    // ユーザーが「渋谷」だけ送ってきたケース
     baseQuery = getPendingPlaceQuery(history);
   }
-
-  // 検索クエリを決定
   const finalQuery = baseQuery ? `${baseQuery} ${userText}` : userText;
 
-  /* ====== SNS / Web 検索（常に実施） ====== */
-  let social = [];
-  let web = [];
-  try {
-    social = await socialSearch(finalQuery);
-    web = await webSearch(finalQuery, {});
-  } catch (e) {
-    console.error("search error:", e);
-  }
-
-  /* ====== LLM に渡す素材 ====== */
-  const sourceText =
-    renderSources(`SNS（直近${RECENCY_DAYS}日）`, social) +
-    renderSources("Web sources", web);
-
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...history,
-    {
-      role: "user",
-      content: `
-【質問】
-${finalQuery}
-
-【意図分類】${intent}
-（場所系のときでも、まず答えを返し、その後に具体住所を補って案内してください）
-
-【検索素材】
-${sourceText || "（該当する公開投稿が少ない/なし）"}
-
-▼ 以下テンプレで回答
-① 結論
-② 具体情報（固有名詞 / 詳細 / 価格や営業時間 / 店名 等）
-③ 最新SNS/WEBの観測（直近${RECENCY_DAYS}日の動き）
-④ 別の選択肢/代案（実店舗 / EC / 相談先 / 動画など）
-⑤ 次の一手（追加質問1つ）
-`,
-    },
-  ];
+  // —— “調査が必要か” を判定
+  const doResearch = intent === "place" || needsResearch(finalQuery);
 
   let reply = "…";
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      temperature: 0.5,
-      max_tokens: 1100,
-    });
-    reply = resp.choices?.[0]?.message?.content?.trim() || "…";
-  } catch (e) {
-    console.error("OpenAI error:", e);
-    reply = "少し混み合っています…もう一度試してみてもらえますか？";
+
+  if (!doResearch) {
+    // ① 会話モード（検索なし）
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...history,
+          { role: "user", content: finalQuery },
+        ],
+        temperature: 0.6,
+        max_tokens: 800,
+      });
+      reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+    } catch (e) {
+      console.error("OpenAI error:", e);
+      reply = "少し込み合ってるみたい。もう一度だけ送ってみて！";
+    }
+  } else {
+    // ② 調査モード（SNS/WEB検索 → 自然文で要約）
+    let social = [];
+    let web = [];
+    try {
+      social = await socialSearch(finalQuery);
+      web = await webSearch(finalQuery, {});
+    } catch (e) {
+      console.error("search error:", e);
+    }
+
+    const sources = [...social, ...web];
+    const sourceText =
+      sources.length > 0
+        ? `（参考：SNS/WEBの直近情報を要約して回答してください。必要なら最後に数件だけURLを付けてOK）`
+        : `（参考：該当する公開投稿は少なめ。推測は慎重に。）`;
+
+    try {
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          ...history,
+          {
+            role: "user",
+            content:
+              `${finalQuery}\n\n${sourceText}\n` +
+              (sources.length ? `\nURL候補:\n${sources.slice(0, 5).map((s, i) => `(${i + 1}) ${s.link}`).join("\n")}` : ""),
+          },
+        ],
+        temperature: 0.5,
+        max_tokens: 1100,
+      });
+      reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+      // 出典が一切入っていない場合のみ、控えめに付与（数件）
+      if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
+        reply += renderSources(sources);
+      }
+    } catch (e) {
+      console.error("OpenAI error:", e);
+      reply = "うまく調べられなかった…キーワードをもう少しだけ具体的に教えてもらえる？";
+    }
   }
 
   await saveMessage(conversationId, "assistant", reply);
