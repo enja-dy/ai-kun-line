@@ -1,8 +1,9 @@
-// index.js — AIくん 完全版
+// index.js — AIくん 完全版（画像解析: Responses API使用）
+//
 // ・テキスト：雑談 / 相談 / リサーチ（場所・住所・説明）対応
 // ・場所B案：近くを聞かれたときだけ「今どこ？」で聞き返す
 // ・SNS/WEBリサーチ：必要なときだけ SerpAPI で検索
-// ・画像：送られた画像を OpenAI Vision で解析して内容を説明
+// ・画像：送られた画像を OpenAI Responses API で解析して内容を説明
 
 import express from "express";
 import * as line from "@line/bot-sdk";
@@ -88,8 +89,8 @@ async function saveMessage(conversationId, role, content) {
 
 /* ========= Google Search via SerpAPI ========= */
 function daysToTbs(days) {
-  if (days <= 7) return "qdr:w";  // 1 week
-  if (days <= 31) return "qdr:m"; // 1 month
+  if (days <= 7) return "qdr:w";
+  if (days <= 31) return "qdr:m";
   return "qdr:y";
 }
 
@@ -274,41 +275,48 @@ app.post("/callback", line.middleware(config), async (req, res) => {
 
 /* ========= MAIN ========= */
 async function handleEvent(event) {
-  // 画像メッセージ（Visionで解析）
+  // 画像メッセージ（Responses APIで解析）
   if (event.type === "message" && event.message?.type === "image") {
     try {
       const stream = await lineClient.getMessageContent(event.message.id);
       const buffer = await streamToBuffer(stream);
       const base64Image = buffer.toString("base64");
 
-      const visionResp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content:
-              "あなたは優しい日本語で説明するアシスタントAIです。画像の内容を、見たまま正確に、簡潔に説明してください。",
-          },
+      // OpenAI Responses API を使った画像解析
+      const visionResp = await openai.responses.create({
+        model: "gpt-4.1-mini",
+        input: [
           {
             role: "user",
             content: [
               {
-                type: "image_url",
-                image_url: `data:image/jpeg;base64,${base64Image}`,
+                type: "input_text",
+                text: "この画像について、どんな場面・物・雰囲気なのか、やさしく日本語で説明してください。",
               },
               {
-                type: "text",
-                text: "この画像について、どんな場面・物・雰囲気なのか、やさしく説明してください。",
+                type: "input_image",
+                image_url: `data:image/jpeg;base64,${base64Image}`,
               },
             ],
           },
         ],
-        max_tokens: 400,
       });
 
-      const answer =
-        visionResp.choices?.[0]?.message?.content?.trim() ||
-        "画像についてうまく説明できませんでした…もう一度送ってもらえる？";
+      let answer = "画像についてうまく説明できませんでした…もう一度送ってもらえる？";
+
+      try {
+        const first = visionResp.output[0];
+        if (first && first.content && first.content.length > 0) {
+          const textPieces = first.content
+            .filter((c) => c.type === "output_text")
+            .map((c) => c.text);
+          if (textPieces.length > 0) {
+            answer = textPieces.join("\n").trim();
+          }
+        }
+      } catch (e) {
+        console.error("parse visionResp error:", e);
+      }
 
       await lineClient.replyMessage(event.replyToken, {
         type: "text",
