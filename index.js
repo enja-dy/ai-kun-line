@@ -57,7 +57,6 @@ const SYSTEM_PROMPT = `
 - 必要なときだけ、最後に質問を1つだけ添えて会話を広げる。
 `;
 
-
 /* ========= 補助関数: LINE画像Stream → Buffer ========= */
 async function streamToBuffer(stream) {
   const chunks = [];
@@ -179,14 +178,13 @@ function classifyIntent(text) {
   const t = text || "";
   const proximity =
     /(近く|周辺|最寄り|どこ(に|で)|付近|近辺|今から行ける|近場)/i.test(t);
-  const askAddress =
-    /(住所|所在地|場所どこ|場所は)/i.test(t);
+  const askAddress = /(住所|所在地|場所どこ|場所は)/i.test(t);
   const describe =
     /(どんな所|どんなところ|どういう(店|場所|施設)|概要|特徴|雰囲気|コンセプト)/i.test(t);
 
-  if (proximity) return "proximity";   // 近くを探したい → 今どこ？
-  if (askAddress) return "address";    // 住所が知りたい
-  if (describe) return "describe";     // どんな場所か知りたい
+  if (proximity) return "proximity"; // 近くを探したい → 今どこ？
+  if (askAddress) return "address"; // 住所が知りたい
+  if (describe) return "describe"; // どんな場所か知りたい
   if (t.trim() === "住所") return "address";
   return "general";
 }
@@ -314,7 +312,8 @@ async function handleEvent(event) {
         ],
       });
 
-      let answer = "画像についてうまく説明できませんでした…もう一度送ってもらえる？";
+      let answer =
+        "画像についてうまく説明できませんでした…もう一度送ってもらえる？";
 
       try {
         const first = visionResp.output[0];
@@ -409,7 +408,13 @@ async function handleEvent(event) {
   }
 
   // 調査の要否
-  const doResearch = needsResearch(intent, finalQuery);
+  let doResearch = needsResearch(intent, finalQuery);
+
+  // ★ 直前に「今どこ？」と聞き返していた場合は、地名だけ返されてもリサーチを強制
+  if (baseQuery) {
+    doResearch = true;
+  }
+
   let reply = "…";
 
   if (!doResearch) {
@@ -442,11 +447,10 @@ async function handleEvent(event) {
     }
 
     const sources = [...social, ...web];
-const hint =
-  sources.length > 0
-    ? "以下のURL候補を参考に、(1) まず一文で結論、(2) 具体的な情報、(3) SNS/WEBで最近言われていることや傾向、(4) 別の選択肢や注意点、(5) ユーザーが今できる次の一手、という流れで自然な日本語の文章としてまとめてください。見出しや番号は付けず、会話口調で書いてください。"
-    : "公開情報が少ない場合でも、(1) 一文の結論、(2) 分かる範囲の具体情報、(3) 注意点や不確実さ、(4) それでもユーザーが取れる次の一手、という流れで自然な日本語の文章にしてください。見出しや番号は付けず、会話口調で書いてください。";
-
+    const hint =
+      sources.length > 0
+        ? "以下のURL候補を参考に、(1) まず一文で結論、(2) 具体的な情報、(3) SNS/WEBで最近言われていることや傾向、(4) 別の選択肢や注意点、(5) ユーザーが今できる次の一手、という流れで自然な日本語の文章としてまとめてください。見出しや番号は付けず、会話口調で書いてください。"
+        : "公開情報が少ない場合でも、(1) 一文の結論、(2) 分かる範囲の具体情報、(3) 注意点や不確実さ、(4) それでもユーザーが取れる次の一手、という流れで自然な日本語の文章にしてください。見出しや番号は付けず、会話口調で書いてください。";
 
     let prompt = finalQuery;
     if (intent === "address") {
@@ -484,6 +488,8 @@ const hint =
         max_tokens: 1100,
       });
       reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+      // URLが本文に含まれていない場合だけ、最後に出典として3件足す
       if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
         reply += renderSources(sources);
       }
