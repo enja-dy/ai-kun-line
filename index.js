@@ -383,11 +383,25 @@ async function handleTextEventTwoStep(event) {
     return;
   }
 
-  // ① 即レス：「今ちょっと調べてるよ…」
+// intent判定を先に行う
+const intent = classifyIntent(userText);
+
+// リサーチが必要な場合のみ「今ちょっと調べてるよ…」を送る
+const needsResearch =
+  intent !== "general" ||
+  /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(userText) ||
+  isProductIntent(userText) ||
+  isVideoWish(userText);
+
+if (needsResearch) {
   await lineClient.replyMessage(event.replyToken, {
     type: "text",
     text: "今ちょっと調べてるよ…少しだけ待っててね🔍",
   });
+} else {
+  // 普通の会話なら即レスしない → このまま裏で普通の返答を作り pushMessage
+}
+
 
   // ② 裏で本処理 → pushMessage
   (async () => {
