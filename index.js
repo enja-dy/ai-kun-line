@@ -395,7 +395,12 @@ async function handleTextEventTwoStep(event) {
         }
       }
 
-      const reply = await buildAiReply(userText, history, intent, tripmallUrl);
+      const reply = await buildAiReply(
+        userText,
+        history,
+        intent,
+        tripmallUrl
+      );
 
       await saveMessage(conversationId, "assistant", reply);
 
@@ -443,4 +448,60 @@ async function buildAiReply(userText, history, intent, tripmallUrl) {
   let web = [];
   try {
     [social, web] = await Promise.all([
-      socia
+      socialSearch(userText),
+      webSearch(userText),
+    ]);
+  } catch (e) {
+    console.error("search error:", e);
+  }
+
+  const sources = [...social, ...web].slice(0, 2);
+
+  let prompt =
+    `${userText}\n\n` +
+    "結論 → 具体情報（2〜4文）→ 最近のSNS/WEBの傾向（最大2件）→ 代案・注意点、という流れで自然な日本語の文章としてまとめてください。見出しや番号は付けないでください。\n";
+
+  if (sources.length) {
+    prompt +=
+      "参考になりそうなURL:\n" +
+      sources.map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
+  }
+
+  if (intent === "product" && tripmallUrl) {
+    prompt += `\n\nこのユーザーは何か商品を探しているので、最後にオンライン最安値の横断検索（TRIPMALL）のURLを控えめに一言そえてください。このURLを使ってください：${tripmallUrl}`;
+  }
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...history,
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.5,
+      max_tokens: 1100,
+    });
+
+    let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+    // 商品intentだがモデルがURLを使わなかった場合の保険として、必ず最後に追加
+    if (intent === "product" && tripmallUrl && !reply.includes(tripmallUrl)) {
+      reply += `\n\nオンライン最安値の横断検索はこちら：\n${tripmallUrl}`;
+    }
+
+    // 出典が本文に無ければ追加（最大2件）
+    if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
+      reply += renderSources(sources);
+    }
+
+    return reply;
+  } catch (e) {
+    console.error("OpenAI error (research):", e);
+    return "うまく調べられなかった…対象名やキーワードを、もう少しだけ具体的に教えてもらえる？";
+  }
+}
+
+/* ========= Start ========= */
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`AI-kun running on ${port}`));
