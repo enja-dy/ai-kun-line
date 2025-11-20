@@ -1,12 +1,14 @@
 // ============================================================================
-// index.js — AIくん 完全版（TRIPMALL 対応 + SYSTEM_PROMPT改訂 + 出典2件）
+// index.js — AIくん 完全統合版（TRIPMALL + 全商品対応 + SYSTEM PROMPT 改訂）
 // ============================================================================
 //
-// ・テキスト：雑談 / 相談 / リサーチ（場所・住所・どんな場所・比較・最新・レビュー）
-// ・商品購入系 → TRIPMALL（Amazon/Rakuten/Yahoo横断検索）リンク自動付与
-// ・SNS/WEBリサーチ（SerpAPI）
-// ・「今どこ？」B案ロジック維持
-// ・SYSTEM_PROMPT はあなたの完全版＋追加文言を反映
+// ・雑談 / 相談 → 通常会話
+// ・リサーチ → SerpAPI + SNS検索 → 結論 → 具体情報 → SNS傾向 → 代案 → 次の一手
+// ・オンライン購入選択肢は必ず自然に添える（控えめ）
+// ・商品探し intent（世の中のすべての商品名に対応）
+// ・TRIPMALL（Amazon/Rakuten/Yahoo横断検索）URL を自動提案
+// ・SNS/WEB 出典は2件
+// ・画像解析 → OpenAI Responses API
 //
 // ============================================================================
 
@@ -34,35 +36,32 @@ const supabase = createClient(
 /* ========= SerpAPI ========= */
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
-/* ========= SNS recency days ========= */
+/* ========= SNS recency ========= */
 const RECENCY_DAYS = Math.max(
   1,
   parseInt(process.env.SOCIAL_SEARCH_RECENCY_DAYS || "14", 10)
 );
 
-/* ========= SYSTEM PROMPT（元の完全版＋追加文言） ========= */
+/* ========= SYSTEM PROMPT（最新版） ========= */
 const SYSTEM_PROMPT = `
 あなたは「AIくん」です。丁寧で親しみやすい自然な日本語で話します。
 
-- 雑談や日常の相談は、普通の会話としてゆるく返事する。構造見出しや番号は出さない。
-- 調査が必要な質問（場所・近くのお店・住所・どんな場所か・比較・最新・在庫・レビュー・動画・評判・ニュースなど）のときだけ、
-  SNS/WEBの検索結果を参考にしながら答える。
+- 雑談や日常の相談は普通の会話として自然に返す（見出し・番号は出さない）。
+- 調査が必要な質問（場所 / 近隣 / 住所 / どんな場所 / 比較 / 最新 / 在庫 / レビュー / 評判 / ニュースなど）のときだけ、
+  SNS/WEB の検索結果を参考にしながら答える。
 
-【リサーチ回答の流れ（見出しは出さない）】
-- まず最初に、ユーザーが一番知りたいポイントを「一文の結論」で伝える。
-- 次に、固有名詞・数字・日付などを含めた「具体情報」を2〜4文で補足する。
-- そのあとで、「最近のSNS/WEB上では〜と言われている / 報告されている」といった形で、直近の傾向や評判を簡潔に紹介する。
-- 余裕があれば、「別の選択肢・代案・注意点」を一言添える。
-- 最後に、ユーザーが今すぐ取れる「次の一手」（例：◯◯で検索してみる、この条件でもう一度相談する など）を一文で提案する。
+【リサーチ回答フロー】
+- 最初に「ユーザーが最も知りたい一文の結論」を述べる。
+- 次に「固有名詞・数字・日付などを含む具体情報」を2〜4文で補足する。
+- 続いて「最近のSNS/WEB上では〜と言われている・報告されている」を紹介する。
+- 余裕があれば「代案・注意点」を控えめに添える。
+- 最後に「ユーザーが今すぐ取れる次の一手」を一文で提案する。
+- オンライン購入の選択肢は必ず自然に添える。ただし回答構造を邪魔しない程度に控えめに提示する。
 
 【スタイル】
-- 箇条書きは必要に応じて軽く使ってよいが、「① 結論」「② 具体情報」のような見出しや番号は付けない。
-- 不確実な情報は「可能性」「未確認」「〜と言われている」など控えめな表現にする。
-- 長くなりすぎないよう、要点を優先しつつ、やさしい会話口調でまとめる。
-- 必要なときだけ、最後に質問を1つだけ添えて会話を広げる。
-
-【追加】
-- 必要に応じて、オンライン購入の選択肢を自然に添えてよい。ただし、回答構造を邪魔しない程度に控えめに提案する。
+- やさしい会話口調。結論→具体→傾向→代案→次の一手。
+- 不確実な情報は「可能性」「〜と言われている」など慎重に表現。
+- 必要なときだけ最後に一つ質問を添えて会話を広げる。
 `;
 
 /* ========= Utility: Stream → Buffer ========= */
@@ -123,7 +122,6 @@ async function webSearch(query, opts = {}) {
     hl,
     api_key: SERPAPI_KEY,
   });
-
   if (tbs) params.set("tbs", tbs);
 
   try {
@@ -143,7 +141,7 @@ async function webSearch(query, opts = {}) {
   }
 }
 
-/* ========= SNS Search (X / Instagram / Reddit) ========= */
+/* ========= SNS Search ========= */
 async function socialSearch(query) {
   const tbs = daysToTbs(RECENCY_DAYS);
   const qs = `${query} (site:x.com OR site:twitter.com OR site:instagram.com OR site:reddit.com)`;
@@ -152,6 +150,7 @@ async function socialSearch(query) {
 
   const seen = new Set();
   const arr = [];
+
   for (const r of raw) {
     const key = r.link.replace(/(\?.*)$/, "");
     if (!seen.has(key)) {
@@ -163,7 +162,7 @@ async function socialSearch(query) {
   return arr;
 }
 
-/* ========= 出典：上限 2 件 ========= */
+/* ========= 出典：上限2件 ========= */
 function renderSources(arr) {
   if (!arr?.length) return "";
   return (
@@ -175,35 +174,41 @@ function renderSources(arr) {
   );
 }
 
-/* ========= Intent 判定 ========= */
+/* ========= Location 判定 ========= */
 const PREFS =
   "北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|東京都|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄";
 
 function hasLocation(text) {
   if (!text) return false;
-  const t = text;
-  return new RegExp(`(${PREFS})`).test(t) || /駅/.test(t);
+  return new RegExp(`(${PREFS})`).test(text) || /駅/.test(text);
 }
 
-function classifyIntent(text) {
-  const t = text || "";
-  if (/(近く|周辺|最寄り|付近)/i.test(t)) return "proximity";
-  if (/(住所|所在地|場所どこ)/i.test(t)) return "address";
-  if (/(どんな所|特徴|雰囲気|概要)/i.test(t)) return "describe";
-  return "general";
-}
-
-/* ========= 商品購入 intent ========= */
+/* ========= 全商品対応：商品購入 intent ========= */
 function isProductWhere(text) {
   const t = text || "";
-  const kw = /(どこで|どこに).*(売って|購入|買え|手に入る)/i.test(t);
-  if (!kw) return false;
-  if (/(近く|周辺)/i.test(t)) return false;
+
+  // ① 購入・入手意図（すべての商品対応）
+  const buy =
+    /(買いたい|買う|買える|購入|欲しい|欲しかった|売ってる|売っている|手に入る|手に入れたい|通販|オンライン|最安|安い|どこで買う|どこで買える|探してる|探している|見つけたい|見つかる)/i.test(
+      t
+    );
+
+  // ② where intent
+  const where = /(どこで|どこに)/i.test(t);
+
+  const hasProductIntent = buy || where;
+  if (!hasProductIntent) return false;
+
+  // ③ "近く" は商品検索ではない
+  if (/(近く|周辺|最寄り)/i.test(t)) return false;
+
+  // ④ 地名入り → 商品検索ではなく場所検索
   if (hasLocation(t)) return false;
+
   return true;
 }
 
-/* ========= TRIPMALL URL 生成 ========= */
+/* ========= TRIPMALL URL ========= */
 function buildTripmallUrl(keyword) {
   const encoded = encodeURIComponent(keyword.trim());
   return keyword.includes(" ")
@@ -218,14 +223,14 @@ app.post("/callback", line.middleware(config), async (req, res) => {
   try {
     await Promise.all((req.body.events ?? []).map(handleEvent));
     res.status(200).end();
-  } catch (e) {
+  } catch {
     res.status(200).end();
   }
 });
 
 /* ========= EVENT HANDLER ========= */
 async function handleEvent(event) {
-  /* ========= 画像 ========= */
+  /* ========= 画像解析 ========= */
   if (event.type === "message" && event.message?.type === "image") {
     try {
       const stream = await lineClient.getMessageContent(event.message.id);
@@ -255,7 +260,7 @@ async function handleEvent(event) {
         "画像を読み取れなかったみたい…もう一度送ってくれる？📷";
 
       try {
-        const first = visionResp.output[0];
+        const first = visionResp.output?.[0];
         if (first?.content?.length) {
           answer = first.content
             .filter((c) => c.type === "output_text")
@@ -284,7 +289,7 @@ async function handleEvent(event) {
   const userText = event.message.text.trim();
   const conversationId = getConversationId(event);
 
-  /* リセット */
+  /* reset */
   if (userText === "リセット" || userText.toLowerCase() === "reset") {
     await supabase
       .from("conversation_messages")
@@ -303,11 +308,17 @@ async function handleEvent(event) {
   const history = await fetchRecentMessages(conversationId);
 
   /* Intent 判定 */
-  const productWhere = isProductWhere(userText);
-  const intent = productWhere ? "product_where" : classifyIntent(userText);
+  const productIntent = isProductWhere(userText);
   const locationHint = hasLocation(userText);
 
-  /* ========= 「近く」→ 今どこ？ ========= */
+  let intent = "general";
+  if (productIntent) intent = "product_where";
+  else if (/(近く|周辺|最寄り)/i.test(userText)) intent = "proximity";
+  else if (/(住所|所在地)/i.test(userText)) intent = "address";
+  else if (/(どんな所|特徴|雰囲気|概要)/i.test(userText))
+    intent = "describe";
+
+  /* proximity: 今どこ？ */
   if (intent === "proximity" && !locationHint) {
     const msg =
       "了解！調べるね。今どこにいますか？（市区町村や最寄り駅でもOK）";
@@ -321,18 +332,15 @@ async function handleEvent(event) {
 
   const finalQuery = userText;
 
-  /* ========= リサーチ必要？ ========= */
+  /* 調査が必要？ */
   const needsResearch =
-    intent === "proximity" ||
-    intent === "address" ||
-    intent === "describe" ||
-    intent === "product_where" ||
-    /(最新|速報|価格|値段|在庫|比較|レビュー|評判)/.test(userText);
+    intent !== "general" ||
+    /(最新|速報|価格|値段|在庫|比較|レビュー|評判|動画)/.test(userText);
 
-  let reply = "…";
+  let reply = "";
 
   if (!needsResearch) {
-    /* ========= 普通の会話 ========= */
+    /* 通常会話 */
     try {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -349,10 +357,9 @@ async function handleEvent(event) {
       reply = "ちょっと混み合ってるみたい…もう一度お願い！";
     }
   } else {
-    /* ========= リサーチモード ========= */
+    /* リサーチモード */
     let social = [];
     let web = [];
-
     try {
       social = await socialSearch(finalQuery);
       web = await webSearch(finalQuery);
@@ -360,10 +367,9 @@ async function handleEvent(event) {
 
     const sources = [...social, ...web];
 
-    const hint =
-      "以下の情報を参考に、結論 → 具体情報 → SNS/WEBの傾向 → 代案 → 次の一手 の流れで自然にまとめてください。見出しや番号は不要です。";
-
-    let prompt = `${finalQuery}\n\n${hint}\n`;
+    let prompt =
+      `${finalQuery}\n\n` +
+      "以下の情報を参考に、結論 → 具体情報 → SNS/WEBの傾向 → 代案 → 次の一手 の流れで自然な日本語の文章として返してください（見出し不要）。\n";
 
     if (sources.length) {
       prompt +=
@@ -388,18 +394,19 @@ async function handleEvent(event) {
 
       reply = resp.choices?.[0]?.message?.content?.trim() || "…";
 
-      /* ========= TRIPMALL（商品系のみ） ========= */
+      /* ===== TRIPMALL（全商品対応） ===== */
       if (intent === "product_where") {
         const url = buildTripmallUrl(finalQuery);
-        reply += `\n\n・オンライン最安値を横断検索（TRIPMALL）\n${url}`;
+        reply += `\n\n・オンライン最安値の横断検索はこちら\n${url}`;
       }
 
-      /* ========= 出典 2 件 ========= */
+      /* ===== 出典 2 件 ===== */
       if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
         reply += renderSources(sources);
       }
     } catch {
-      reply = "うまく調べられなかった…キーワードを少し変えて教えて！";
+      reply =
+        "うまく調べられなかった…もう少し詳しくキーワードを教えてくれる？";
     }
   }
 
