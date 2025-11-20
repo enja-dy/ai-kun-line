@@ -1,9 +1,14 @@
-// index.js — AIくん 完全版（画像解析: Responses API使用）
+// ============================================================================
+// index.js — AIくん 完全版（TRIPMALL 対応 + SYSTEM_PROMPT改訂 + 出典2件）
+// ============================================================================
 //
-// ・テキスト：雑談 / 相談 / リサーチ（場所・住所・説明）対応
-// ・場所B案：近くを聞かれたときだけ「今どこ？」で聞き返す
-// ・SNS/WEBリサーチ：必要なときだけ SerpAPI で検索
-// ・画像：送られた画像を OpenAI Responses API で解析して内容を説明
+// ・テキスト：雑談 / 相談 / リサーチ（場所・住所・どんな場所・比較・最新・レビュー）
+// ・商品購入系 → TRIPMALL（Amazon/Rakuten/Yahoo横断検索）リンク自動付与
+// ・SNS/WEBリサーチ（SerpAPI）
+// ・「今どこ？」B案ロジック維持
+// ・SYSTEM_PROMPT はあなたの完全版＋追加文言を反映
+//
+// ============================================================================
 
 import express from "express";
 import * as line from "@line/bot-sdk";
@@ -35,7 +40,7 @@ const RECENCY_DAYS = Math.max(
   parseInt(process.env.SOCIAL_SEARCH_RECENCY_DAYS || "14", 10)
 );
 
-/* ========= SYSTEM PROMPT（見出しなし＆会話優先） ========= */
+/* ========= SYSTEM PROMPT（元の完全版＋追加文言） ========= */
 const SYSTEM_PROMPT = `
 あなたは「AIくん」です。丁寧で親しみやすい自然な日本語で話します。
 
@@ -55,14 +60,15 @@ const SYSTEM_PROMPT = `
 - 不確実な情報は「可能性」「未確認」「〜と言われている」など控えめな表現にする。
 - 長くなりすぎないよう、要点を優先しつつ、やさしい会話口調でまとめる。
 - 必要なときだけ、最後に質問を1つだけ添えて会話を広げる。
+
+【追加】
+- 必要に応じて、オンライン購入の選択肢を自然に添えてよい。ただし、回答構造を邪魔しない程度に控えめに提案する。
 `;
 
-/* ========= 補助関数: LINE画像Stream → Buffer ========= */
+/* ========= Utility: Stream → Buffer ========= */
 async function streamToBuffer(stream) {
   const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
+  for await (const c of stream) chunks.push(c);
   return Buffer.concat(chunks);
 }
 
@@ -88,8 +94,8 @@ async function fetchRecentMessages(conversationId) {
 
   return (data ?? [])
     .reverse()
-    .map((r) => ({ role: r.role, content: r.content }))
-    .filter((m) => m.role === "user" || m.role === "assistant");
+    .filter((r) => r.role === "user" || r.role === "assistant")
+    .map((r) => ({ role: r.role, content: r.content }));
 }
 
 async function saveMessage(conversationId, role, content) {
@@ -98,7 +104,7 @@ async function saveMessage(conversationId, role, content) {
   ]);
 }
 
-/* ========= Google Search via SerpAPI ========= */
+/* ========= SerpAPI Google Search ========= */
 function daysToTbs(days) {
   if (days <= 7) return "qdr:w";
   if (days <= 31) return "qdr:m";
@@ -108,6 +114,7 @@ function daysToTbs(days) {
 async function webSearch(query, opts = {}) {
   if (!SERPAPI_KEY) return [];
   const { num = 6, gl = "jp", hl = "ja", tbs } = opts;
+
   const params = new URLSearchParams({
     engine: "google",
     q: query,
@@ -116,33 +123,32 @@ async function webSearch(query, opts = {}) {
     hl,
     api_key: SERPAPI_KEY,
   });
+
   if (tbs) params.set("tbs", tbs);
 
-  const url = `https://serpapi.com/search.json?${params.toString()}`;
   try {
-    const r = await fetch(url);
+    const r = await fetch(
+      `https://serpapi.com/search.json?${params.toString()}`
+    );
     const j = await r.json();
-    const items = j.organic_results || [];
-    return items
+    return (j.organic_results || [])
       .filter((it) => it.title && it.link)
       .map((it) => ({
         title: it.title,
         snippet: it.snippet || "",
         link: it.link,
       }));
-  } catch (e) {
-    console.error("webSearch error:", e);
+  } catch {
     return [];
   }
 }
 
-/* ========= SNS (X / Instagram / Reddit) ========= */
-async function socialSearch(queryText) {
+/* ========= SNS Search (X / Instagram / Reddit) ========= */
+async function socialSearch(query) {
   const tbs = daysToTbs(RECENCY_DAYS);
-  const siteQuery =
-    '(site:x.com OR site:twitter.com) OR site:instagram.com OR site:reddit.com';
-  const q = `${queryText} ${siteQuery}`;
-  const raw = await webSearch(q, { num: 8, tbs, gl: "jp", hl: "ja" });
+  const qs = `${query} (site:x.com OR site:twitter.com OR site:instagram.com OR site:reddit.com)`;
+
+  const raw = await webSearch(qs, { num: 8, tbs, gl: "jp", hl: "ja" });
 
   const seen = new Set();
   const arr = [];
@@ -157,142 +163,75 @@ async function socialSearch(queryText) {
   return arr;
 }
 
-/* ========= Sources render ========= */
+/* ========= 出典：上限 2 件 ========= */
 function renderSources(arr) {
   if (!arr?.length) return "";
-  const lines = arr
-    .slice(0, 3)
-    .map((s, i) => `(${i + 1}) ${s.link}`)
-    .join("\n");
-  return `\n\n出典:\n${lines}`;
+  return (
+    "\n\n出典:\n" +
+    arr
+      .slice(0, 2)
+      .map((s, i) => `(${i + 1}) ${s.link}`)
+      .join("\n")
+  );
 }
 
-/* ========= Intent & helpers ========= */
+/* ========= Intent 判定 ========= */
 const PREFS =
   "北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|東京都|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄";
-const BIG_CITIES =
-  "札幌|仙台|東京|渋谷|新宿|池袋|横浜|川崎|千葉|大宮|名古屋|京都|大阪|梅田|難波|天王寺|神戸|三宮|博多|天神|福岡|那覇|鎌倉|吉祥寺|中目黒|下北沢";
 
-/** 目的別：近接/住所/説明/その他 を判定 */
+function hasLocation(text) {
+  if (!text) return false;
+  const t = text;
+  return new RegExp(`(${PREFS})`).test(t) || /駅/.test(t);
+}
+
 function classifyIntent(text) {
   const t = text || "";
-  const proximity =
-    /(近く|周辺|最寄り|どこ(に|で)|付近|近辺|今から行ける|近場)/i.test(t);
-  const askAddress = /(住所|所在地|場所どこ|場所は)/i.test(t);
-  const describe =
-    /(どんな所|どんなところ|どういう(店|場所|施設)|概要|特徴|雰囲気|コンセプト)/i.test(t);
-
-  if (proximity) return "proximity"; // 近くを探したい → 今どこ？
-  if (askAddress) return "address"; // 住所が知りたい
-  if (describe) return "describe"; // どんな場所か知りたい
-  if (t.trim() === "住所") return "address";
+  if (/(近く|周辺|最寄り|付近)/i.test(t)) return "proximity";
+  if (/(住所|所在地|場所どこ)/i.test(t)) return "address";
+  if (/(どんな所|特徴|雰囲気|概要)/i.test(t)) return "describe";
   return "general";
 }
 
-function hasLocationHint(text) {
+/* ========= 商品購入 intent ========= */
+function isProductWhere(text) {
   const t = text || "";
-  const re1 = new RegExp(`(${PREFS})`);
-  const re2 = new RegExp(`(${BIG_CITIES})`);
-  if (re1.test(t) || re2.test(t)) return true;
-  if (/駅/.test(t)) return true;
-  return false;
+  const kw = /(どこで|どこに).*(売って|購入|買え|手に入る)/i.test(t);
+  if (!kw) return false;
+  if (/(近く|周辺)/i.test(t)) return false;
+  if (hasLocation(t)) return false;
+  return true;
 }
 
-/** 会話履歴から対象名を推定（直近の固有名詞） */
-async function inferTargetFromHistory(history, currentText) {
-  try {
-    const sample = [...history].slice(-6);
-    const msg = [
-      {
-        role: "system",
-        content:
-          "直近の会話から、ユーザーが今話題にしている対象の固有名詞（店名・施設名・物件名・商品名など）を1つ抽出して返してください。なければ空文字だけ返してください。",
-      },
-      ...sample,
-      {
-        role: "user",
-        content: `今回の入力: ${currentText}\n対象があれば固有名詞のみ、なければ空文字。`,
-      },
-    ];
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: msg,
-      temperature: 0,
-      max_tokens: 30,
-    });
-    const name =
-      (resp.choices?.[0]?.message?.content || "")
-        .trim()
-        .replace(/^[「『(（\s]+|[」』)）\s]+$/g, "") || "";
-    return name || null;
-  } catch (e) {
-    console.error("inferTargetFromHistory error:", e);
-    return null;
-  }
+/* ========= TRIPMALL URL 生成 ========= */
+function buildTripmallUrl(keyword) {
+  const encoded = encodeURIComponent(keyword.trim());
+  return keyword.includes(" ")
+    ? `https://tripmall.online/search/?category=ALL&q=${encoded}&sort=`
+    : `https://tripmall.online/search/?q=${encoded}&sort=`;
 }
 
-/** 調査の必要性（雑談/相談はfalse） */
-function needsResearch(intent, text) {
-  if (intent === "proximity" || intent === "address" || intent === "describe") {
-    return true;
-  }
-  const t = (text || "").toLowerCase();
-  const cues = [
-    "最新",
-    "速報",
-    "価格",
-    "値段",
-    "在庫",
-    "比較",
-    "レビュー",
-    "評判",
-    "動画",
-    "公式",
-    "発表",
-    "ニュース",
-  ];
-  return cues.some((kw) => t.includes(kw));
-}
-
-/** 直前の「今どこ？」の前の質問を取得 */
-function getPendingPlaceQuery(history) {
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i];
-    if (m.role === "assistant" && /今どこにいますか？/.test(m.content)) {
-      for (let j = i - 1; j >= 0; j--) {
-        if (history[j].role === "user") return history[j].content.trim();
-      }
-      break;
-    }
-  }
-  return null;
-}
-
-/* ========= Health ========= */
+/* ========= MAIN ========= */
 app.get("/", (_, res) => res.send("AI-kun running"));
 
-/* ========= Webhook ========= */
 app.post("/callback", line.middleware(config), async (req, res) => {
   try {
-    const events = req.body.events ?? [];
-    await Promise.all(events.map(handleEvent));
+    await Promise.all((req.body.events ?? []).map(handleEvent));
     res.status(200).end();
   } catch (e) {
-    console.error("Webhook error:", e);
     res.status(200).end();
   }
 });
 
-/* ========= MAIN ========= */
+/* ========= EVENT HANDLER ========= */
 async function handleEvent(event) {
-  // 画像メッセージ（Responses APIで解析）
+  /* ========= 画像 ========= */
   if (event.type === "message" && event.message?.type === "image") {
     try {
       const stream = await lineClient.getMessageContent(event.message.id);
-      const buffer = await streamToBuffer(stream);
-      const base64Image = buffer.toString("base64");
+      const buf = await streamToBuffer(stream);
+      const b64 = buf.toString("base64");
 
-      // OpenAI Responses API を使った画像解析
       const visionResp = await openai.responses.create({
         model: "gpt-4.1-mini",
         input: [
@@ -301,11 +240,11 @@ async function handleEvent(event) {
             content: [
               {
                 type: "input_text",
-                text: "この画像について、どんな場面・物・雰囲気なのか、やさしく日本語で説明してください。",
+                text: "この画像について、やさしい日本語で説明してください。",
               },
               {
                 type: "input_image",
-                image_url: `data:image/jpeg;base64,${base64Image}`,
+                image_url: `data:image/jpeg;base64,${b64}`,
               },
             ],
           },
@@ -313,53 +252,49 @@ async function handleEvent(event) {
       });
 
       let answer =
-        "画像についてうまく説明できませんでした…もう一度送ってもらえる？";
+        "画像を読み取れなかったみたい…もう一度送ってくれる？📷";
 
       try {
         const first = visionResp.output[0];
-        if (first && first.content && first.content.length > 0) {
-          const textPieces = first.content
+        if (first?.content?.length) {
+          answer = first.content
             .filter((c) => c.type === "output_text")
-            .map((c) => c.text);
-          if (textPieces.length > 0) {
-            answer = textPieces.join("\n").trim();
-          }
+            .map((c) => c.text)
+            .join("\n")
+            .trim();
         }
-      } catch (e) {
-        console.error("parse visionResp error:", e);
-      }
+      } catch {}
 
       await lineClient.replyMessage(event.replyToken, {
         type: "text",
         text: answer,
       });
-    } catch (err) {
-      console.error("Image analysis error:", err);
+    } catch {
       await lineClient.replyMessage(event.replyToken, {
         type: "text",
-        text: "画像をうまく読み取れなかったみたい…もう一度送ってくれる？📷",
+        text: "画像を読み取れなかったよ…もう一度お願い！📷",
       });
     }
     return;
   }
 
-  // テキスト以外は現時点では無視
-  if (event.type !== "message" || event.message?.type !== "text") {
-    return;
-  }
+  /* ========= テキスト ========= */
+  if (event.type !== "message" || event.message?.type !== "text") return;
 
-  const userText = (event.message.text ?? "").trim();
+  const userText = event.message.text.trim();
   const conversationId = getConversationId(event);
 
-  // reset
+  /* リセット */
   if (userText === "リセット" || userText.toLowerCase() === "reset") {
     await supabase
       .from("conversation_messages")
       .delete()
       .eq("conversation_id", conversationId);
+
+    const msg = "会話履歴をリセットしたよ。どうぞ！";
     await lineClient.replyMessage(event.replyToken, {
       type: "text",
-      text: "会話履歴をリセットしました。どうぞ！",
+      text: msg,
     });
     return;
   }
@@ -367,58 +302,37 @@ async function handleEvent(event) {
   await saveMessage(conversationId, "user", userText);
   const history = await fetchRecentMessages(conversationId);
 
-  // Intent & location
-  const intent = classifyIntent(userText);
-  const locationInText = hasLocationHint(userText);
+  /* Intent 判定 */
+  const productWhere = isProductWhere(userText);
+  const intent = productWhere ? "product_where" : classifyIntent(userText);
+  const locationHint = hasLocation(userText);
 
-  // 近接検索だけ、地名なしなら「今どこ？」（B案）
-  if (intent === "proximity" && !locationInText) {
-    const reply =
+  /* ========= 「近く」→ 今どこ？ ========= */
+  if (intent === "proximity" && !locationHint) {
+    const msg =
       "了解！調べるね。今どこにいますか？（市区町村や最寄り駅でもOK）";
-    await saveMessage(conversationId, "assistant", reply);
+    await saveMessage(conversationId, "assistant", msg);
     await lineClient.replyMessage(event.replyToken, {
       type: "text",
-      text: reply,
+      text: msg,
     });
     return;
   }
 
-  // 対象名の推定（住所/どんな所？でターゲット不明なとき）
-  let targetName = null;
-  if (intent === "address" || intent === "describe") {
-    targetName = await inferTargetFromHistory(history, userText);
-  }
+  const finalQuery = userText;
 
-  // 「渋谷」など場所単体 → 直前の基点質問を補完
-  let baseQuery = null;
-  if (
-    locationInText &&
-    intent !== "proximity" &&
-    !/住所|どんな所|どんなところ/.test(userText)
-  ) {
-    baseQuery = getPendingPlaceQuery(history);
-  }
-
-  // 検索クエリを決定
-  let finalQuery = userText;
-  if (targetName && (intent === "address" || intent === "describe")) {
-    finalQuery = `${targetName} 住所 概要`;
-  } else if (baseQuery) {
-    finalQuery = `${baseQuery} ${userText}`;
-  }
-
-  // 調査の要否
-  let doResearch = needsResearch(intent, finalQuery);
-
-  // ★ 直前に「今どこ？」と聞き返していた場合は、地名だけ返されてもリサーチを強制
-  if (baseQuery) {
-    doResearch = true;
-  }
+  /* ========= リサーチ必要？ ========= */
+  const needsResearch =
+    intent === "proximity" ||
+    intent === "address" ||
+    intent === "describe" ||
+    intent === "product_where" ||
+    /(最新|速報|価格|値段|在庫|比較|レビュー|評判)/.test(userText);
 
   let reply = "…";
 
-  if (!doResearch) {
-    // 会話モード（検索なし）
+  if (!needsResearch) {
+    /* ========= 普通の会話 ========= */
     try {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -431,39 +345,33 @@ async function handleEvent(event) {
         max_tokens: 800,
       });
       reply = resp.choices?.[0]?.message?.content?.trim() || "…";
-    } catch (e) {
-      console.error("OpenAI error (chat):", e);
-      reply = "少し込み合ってるみたい。もう一度だけ送ってみて！";
+    } catch {
+      reply = "ちょっと混み合ってるみたい…もう一度お願い！";
     }
   } else {
-    // 調査モード（SNS/WEB検索 → 要約）
+    /* ========= リサーチモード ========= */
     let social = [];
     let web = [];
+
     try {
       social = await socialSearch(finalQuery);
-      web = await webSearch(finalQuery, {});
-    } catch (e) {
-      console.error("search error:", e);
-    }
+      web = await webSearch(finalQuery);
+    } catch {}
 
     const sources = [...social, ...web];
-    const hint =
-      sources.length > 0
-        ? "以下のURL候補を参考に、(1) まず一文で結論、(2) 具体的な情報、(3) SNS/WEBで最近言われていることや傾向、(4) 別の選択肢や注意点、(5) ユーザーが今できる次の一手、という流れで自然な日本語の文章としてまとめてください。見出しや番号は付けず、会話口調で書いてください。"
-        : "公開情報が少ない場合でも、(1) 一文の結論、(2) 分かる範囲の具体情報、(3) 注意点や不確実さ、(4) それでもユーザーが取れる次の一手、という流れで自然な日本語の文章にしてください。見出しや番号は付けず、会話口調で書いてください。";
 
-    let prompt = finalQuery;
-    if (intent === "address") {
+    const hint =
+      "以下の情報を参考に、結論 → 具体情報 → SNS/WEBの傾向 → 代案 → 次の一手 の流れで自然にまとめてください。見出しや番号は不要です。";
+
+    let prompt = `${finalQuery}\n\n${hint}\n`;
+
+    if (sources.length) {
       prompt +=
-        "\n（住所・所在地・アクセス・目印を優先して、簡潔に教えてください。）";
-    }
-    if (intent === "describe") {
-      prompt +=
-        "\n（どんな場所/施設/物件か、特徴・雰囲気・価格帯や利用シーンなどを、分かりやすく教えてください。）";
-    }
-    if (intent === "proximity" && locationInText) {
-      prompt +=
-        "\n（指定エリア内の候補を具体名で挙げ、混雑/在庫の傾向などが分かれば触れてください。）";
+        "URL候補:\n" +
+        sources
+          .slice(0, 2)
+          .map((s, i) => `(${i + 1}) ${s.link}`)
+          .join("\n");
     }
 
     try {
@@ -472,31 +380,26 @@ async function handleEvent(event) {
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           ...history,
-          {
-            role: "user",
-            content:
-              `${prompt}\n\n${hint}\n` +
-              (sources.length
-                ? `URL候補:\n${sources
-                    .slice(0, 5)
-                    .map((s, i) => `(${i + 1}) ${s.link}`)
-                    .join("\n")}`
-                : ""),
-          },
+          { role: "user", content: prompt },
         ],
         temperature: 0.5,
-        max_tokens: 1100,
+        max_tokens: 1200,
       });
+
       reply = resp.choices?.[0]?.message?.content?.trim() || "…";
 
-      // URLが本文に含まれていない場合だけ、最後に出典として3件足す
+      /* ========= TRIPMALL（商品系のみ） ========= */
+      if (intent === "product_where") {
+        const url = buildTripmallUrl(finalQuery);
+        reply += `\n\n・オンライン最安値を横断検索（TRIPMALL）\n${url}`;
+      }
+
+      /* ========= 出典 2 件 ========= */
       if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
         reply += renderSources(sources);
       }
-    } catch (e) {
-      console.error("OpenAI error (research):", e);
-      reply =
-        "うまく調べられなかった…対象名やキーワードを、もう少しだけ具体的に教えてもらえる？";
+    } catch {
+      reply = "うまく調べられなかった…キーワードを少し変えて教えて！";
     }
   }
 
