@@ -5,6 +5,7 @@
 // ・SerpAPI + SNSリサーチ
 // ・TRIPMALL：商品名抽出（GPT）→ 検索URL自動付与
 // ・SNS出典：最大2件
+// ・「◯◯の動画が見たい」→ BIGO LIVE を必ず提案
 // ============================================================================
 
 import express from "express";
@@ -37,6 +38,9 @@ const RECENCY_DAYS = Math.max(
   parseInt(process.env.SOCIAL_SEARCH_RECENCY_DAYS || "14", 10)
 );
 
+/* ========= External URLs ========= */
+const BIGO_LIVE_URL = "https://tripmall.online/bigo-live/";
+
 /* ========= SYSTEM PROMPT ========= */
 const SYSTEM_PROMPT = `
 あなたは「AIくん」です。丁寧で親しみやすい自然な日本語で話します。
@@ -50,7 +54,7 @@ const SYSTEM_PROMPT = `
 - 次に、固有名詞・数字・日付を含む「具体情報」を2〜4文で補足。
 - 続いて、SNS/WEBで最近言われていることや傾向を簡潔に紹介する（最大2件）。
 - 余裕があれば、別の選択肢や注意点を軽く添える。
-- 最後に、商品を探している質問であれば、オンライン最安値の横断検索（TRIPMALL）のURLを控えめに自然に添える。
+- 商品を探している質問であれば、最後にオンライン最安値の横断検索（TRIPMALL）のURLを控えめに自然に添える。
 
 【スタイル】
 - 見出しや番号は付けない。
@@ -211,6 +215,16 @@ function isProductIntent(text) {
   if (hasLocation(t)) return false;
 
   return true;
+}
+
+/* ========= 動画視聴希望の判定 ========= */
+function isVideoWish(text) {
+  if (!text) return false;
+  const t = text;
+  // 「〜の動画が見たい / 探している」など
+  return /動画が見たい|動画見たい|動画を見たい|動画探してる|動画を探している|動画ないかな|動画みたい/i.test(
+    t
+  );
 }
 
 /* ========= Intent分類 ========= */
@@ -384,6 +398,7 @@ async function handleTextEventTwoStep(event) {
       const history = await fetchRecentMessages(conversationId);
 
       const intent = classifyIntent(userText);
+      const videoWish = isVideoWish(userText);
 
       // 商品intentならTRIPMALL用の商品名抽出
       let productName = "";
@@ -399,7 +414,8 @@ async function handleTextEventTwoStep(event) {
         userText,
         history,
         intent,
-        tripmallUrl
+        tripmallUrl,
+        videoWish
       );
 
       await saveMessage(conversationId, "assistant", reply);
@@ -415,7 +431,13 @@ async function handleTextEventTwoStep(event) {
 }
 
 /* ========= 本回答生成ロジック ========= */
-async function buildAiReply(userText, history, intent, tripmallUrl) {
+async function buildAiReply(
+  userText,
+  history,
+  intent,
+  tripmallUrl,
+  videoWish
+) {
   // 調査が必要か？
   const needsResearch =
     intent !== "general" ||
@@ -436,7 +458,14 @@ async function buildAiReply(userText, history, intent, tripmallUrl) {
         temperature: 0.6,
         max_tokens: 800,
       });
-      return resp.choices?.[0]?.message?.content?.trim() || "…";
+      let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+
+      // 動画視聴希望なら BIGO LIVE を提案
+      if (videoWish) {
+        reply += `\n\nこの動画配信アプリ「BIGO LIVE」でみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
+      }
+
+      return reply;
     } catch (e) {
       console.error("OpenAI error (chat):", e);
       return "ちょっと混み合ってるみたい…もう一度送ってみて！";
@@ -493,6 +522,11 @@ async function buildAiReply(userText, history, intent, tripmallUrl) {
     // 出典が本文に無ければ追加（最大2件）
     if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
       reply += renderSources(sources);
+    }
+
+    // 動画視聴希望なら BIGO LIVE を提案
+    if (videoWish && !reply.includes(BIGO_LIVE_URL)) {
+      reply += `\n\nこの動画配信アプリ「BIGO LIVE」でみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
     }
 
     return reply;
