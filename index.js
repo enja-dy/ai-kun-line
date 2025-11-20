@@ -220,12 +220,26 @@ function isProductIntent(text) {
 /* ========= 動画視聴希望の判定 ========= */
 function isVideoWish(text) {
   if (!text) return false;
-  const t = text;
-  // 「〜の動画が見たい / 探している」など
-  return /動画が見たい|動画見たい|動画を見たい|動画探してる|動画を探している|動画ないかな|動画みたい/i.test(
-    t
-  );
+  const t = text.trim();
+
+  // 明示的な「動画が見たい／探してる」パターン
+  if (
+    /動画が見たい|動画見たい|動画を見たい|動画探してる|動画を探している|動画ないかな|動画みたい/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+
+  // 「〇〇の動画」「〇〇動画」「〇〇の動画？」など、
+  // 文末が「動画」で終わるコメントも「見たい」とみなす
+  if (/動画[！!？\?」]*$/.test(t)) {
+    return true;
+  }
+
+  return false;
 }
+
 
 /* ========= Intent分類 ========= */
 function classifyIntent(text) {
