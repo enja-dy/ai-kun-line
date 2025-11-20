@@ -1,10 +1,11 @@
-// index.js — AIくん 完全版（TRIPMALL対応 + 画像解析 + 商品名抽出強化）
-//
-// ・テキスト：雑談 / 相談 / リサーチ（場所・住所・説明・商品検索）対応
-// ・SNS/WEBリサーチ：SerpAPI
-// ・画像解析：OpenAI Responses API
-// ・TRIPMALL：Amazon / 楽天 / Yahoo の横断検索を自動提案（商品名抽出）
-// ・回答構造：結論 → 具体情報 → SNS傾向（最大2件）→ 代案 → TRIPMALL
+// ============================================================================
+// index.js — AIくん 完全版
+// ・テキスト：即レス「調べてるよ」→ 後から本回答（pushMessage）
+// ・画像：その場で解析して即返信
+// ・SerpAPI + SNSリサーチ
+// ・TRIPMALL：商品名抽出（GPT）→ 検索URL自動付与
+// ・SNS出典：最大2件
+// ============================================================================
 
 import express from "express";
 import * as line from "@line/bot-sdk";
@@ -47,12 +48,12 @@ const SYSTEM_PROMPT = `
 【リサーチ回答フロー】
 - まず「結論」を一文で伝える。
 - 次に、固有名詞・数字・日付を含む「具体情報」を2〜4文で補足。
-- 続いて「SNS/WEBで最近言われていること」を短く紹介（最大2件）。
-- 余裕があれば「別の選択肢・代案・注意点」を添える。
-- 最後に、必ず「オンライン最安値の横断検索（TRIPMALL）」のURLを提示する（控えめに自然に）。
+- 続いて、SNS/WEBで最近言われていることや傾向を簡潔に紹介する（最大2件）。
+- 余裕があれば、別の選択肢や注意点を軽く添える。
+- 最後に、商品を探している質問であれば、オンライン最安値の横断検索（TRIPMALL）のURLを控えめに自然に添える。
 
 【スタイル】
-- 見出し・番号は付けない。
+- 見出しや番号は付けない。
 - 文体はやさしい会話調で、長くしすぎない。
 - 不確実な情報は「可能性」「〜と言われている」など慎重に。
 `;
@@ -60,7 +61,7 @@ const SYSTEM_PROMPT = `
 /* ========= Util: Stream → Buffer ========= */
 async function streamToBuffer(stream) {
   const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
+  for await (const c of stream) chunks.push(c);
   return Buffer.concat(chunks);
 }
 
@@ -71,6 +72,15 @@ function getConversationId(event) {
   if (s.roomId) return `room:${s.roomId}`;
   if (s.userId) return `user:${s.userId}`;
   return "unknown";
+}
+
+/* ========= Push 先 ID ========= */
+function getPushTarget(event) {
+  const s = event.source ?? {};
+  if (s.userId) return s.userId;
+  if (s.groupId) return s.groupId;
+  if (s.roomId) return s.roomId;
+  return null;
 }
 
 /* ========= DB ========= */
@@ -86,8 +96,8 @@ async function fetchRecentMessages(conversationId) {
 
   return (data ?? [])
     .reverse()
-    .map((r) => ({ role: r.role, content: r.content }))
-    .filter((m) => m.role === "user" || m.role === "assistant");
+    .filter((r) => r.role === "user" || r.role === "assistant")
+    .map((r) => ({ role: r.role, content: r.content }));
 }
 
 async function saveMessage(conversationId, role, content) {
@@ -118,42 +128,108 @@ async function webSearch(query, opts = {}) {
   if (tbs) params.set("tbs", tbs);
 
   try {
-    const j = await (await fetch("https://serpapi.com/search.json?" + params)).json();
+    const res = await fetch(
+      `https://serpapi.com/search.json?${params.toString()}`
+    );
+    const j = await res.json();
     const items = j.organic_results || [];
     return items
+      .filter((it) => it.title && it.link)
       .map((it) => ({
         title: it.title,
         snippet: it.snippet || "",
         link: it.link,
-      }))
-      .filter((x) => x.title && x.link);
+      }));
   } catch (e) {
     console.error("webSearch error:", e);
     return [];
   }
 }
 
-/* ========= SNS Search (X / Instagram / Reddit) ========= */
+/* ========= SNS Search ========= */
 async function socialSearch(queryText) {
   const tbs = daysToTbs(RECENCY_DAYS);
-  const q = `${queryText} (site:x.com OR site:twitter.com OR site:instagram.com OR site:reddit.com)`;
+  const q =
+    `${queryText} ` +
+    "(site:x.com OR site:twitter.com OR site:instagram.com OR site:reddit.com)";
 
-  const raw = await webSearch(q, { num: 8, tbs });
+  const raw = await webSearch(q, { num: 8, tbs, gl: "jp", hl: "ja" });
   const seen = new Set();
   const arr = [];
 
-  for (const item of raw) {
-    const key = item.link.replace(/(\?.*)$/, "");
+  for (const r of raw) {
+    const key = r.link.replace(/(\?.*)$/, "");
     if (!seen.has(key)) {
       seen.add(key);
-      arr.push(item);
+      arr.push(r);
     }
-    if (arr.length >= 2) break; // ★ SNS 出典は最大2つ
+    if (arr.length >= 2) break; // ★最大2件
   }
   return arr;
 }
 
-/* ========= TRIPMALL 商品名抽出（GPT使用） ========= */
+/* ========= 出典（最大2件） ========= */
+function renderSources(arr) {
+  if (!arr?.length) return "";
+  return (
+    "\n\n出典:\n" +
+    arr
+      .slice(0, 2)
+      .map((s, i) => `(${i + 1}) ${s.link}`)
+      .join("\n")
+  );
+}
+
+/* ========= Location 判定 ========= */
+const PREFS =
+  "北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|東京都|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄";
+
+function hasLocation(text) {
+  if (!text) return false;
+  return new RegExp(`(${PREFS})`).test(text) || /駅/.test(text);
+}
+
+/* ========= 商品 intent 判定 ========= */
+function isProductIntent(text) {
+  const t = text || "";
+
+  const buyIntents =
+    /(買いたい|買う|買える|購入|欲しい|欲しかった|売ってる|売っている|手に入る|手に入れたい|通販|オンライン|最安|安い|どこで買う|どこで買える|探してる|探している|見つけたい|見つかる)/i.test(
+      t
+    );
+
+  const whereIntents =
+    /(どこで|どこに)/i.test(t) &&
+    /(ある|売ってる|売っている|買える|置いてる|置いてある)/i.test(t);
+
+  const productLike = buyIntents || whereIntents;
+  if (!productLike) return false;
+
+  // 「近く系」は除外（店舗検索）
+  if (/(近く|周辺|最寄り)/i.test(t)) return false;
+  // 明確な地名が入っている場合も除外（場所検索扱い）
+  if (hasLocation(t)) return false;
+
+  return true;
+}
+
+/* ========= Intent分類 ========= */
+function classifyIntent(text) {
+  const t = text || "";
+  if (isProductIntent(t)) return "product";
+  if (/(近く|周辺|最寄り)/i.test(t)) return "proximity";
+  if (/(住所|所在地)/i.test(t)) return "address";
+  if (/(どんな所|特徴|雰囲気|概要)/i.test(t)) return "describe";
+  return "general";
+}
+
+/* ========= TRIPMALL URL ========= */
+function buildTripmallUrlFromProductName(productName) {
+  const encoded = encodeURIComponent(productName.trim());
+  return `https://tripmall.online/search/?q=${encoded}&sort=`;
+}
+
+/* ========= TRIPMALL 用 商品名抽出（GPT） ========= */
 async function extractProductName(text) {
   try {
     const prompt = `
@@ -177,31 +253,40 @@ async function extractProductName(text) {
       max_tokens: 50,
     });
 
-    const name = resp.choices?.[0]?.message?.content?.trim();
-    return name || "";
+    const name = resp.choices?.[0]?.message?.content?.trim() || "";
+    return name.replace(/^[「『\s]+|[」』\s]+$/g, "");
   } catch (e) {
     console.error("extractProductName error:", e);
     return "";
   }
 }
 
-/* ========= Intent 判定 ========= */
-function classifyIntent(text) {
-  const t = text.toLowerCase();
-  if (/どこ|売ってる|買える|手に入れたい|通販|安い|探してる/.test(t)) return "product";
-  if (/近く|周辺|最寄り/.test(t)) return "proximity";
-  if (/住所|所在地/.test(t)) return "address";
-  if (/どんな所|特徴|概要/.test(t)) return "describe";
-  return "general";
-}
-
-/* ========= Health Check ========= */
+/* ========= Health ========= */
 app.get("/", (_, res) => res.send("AI-kun running"));
 
 /* ========= Webhook ========= */
 app.post("/callback", line.middleware(config), async (req, res) => {
   try {
-    await Promise.all((req.body.events ?? []).map(handleEvent));
+    const events = req.body.events ?? [];
+
+    await Promise.all(
+      events.map(async (event) => {
+        // 画像は従来どおり即返信
+        if (event.type === "message" && event.message?.type === "image") {
+          await handleImageEvent(event);
+          return;
+        }
+
+        // テキストは 2段階方式
+        if (event.type === "message" && event.message?.type === "text") {
+          await handleTextEventTwoStep(event);
+          return;
+        }
+
+        // それ以外は今は無視
+      })
+    );
+
     res.status(200).end();
   } catch (e) {
     console.error("Webhook error:", e);
@@ -209,87 +294,132 @@ app.post("/callback", line.middleware(config), async (req, res) => {
   }
 });
 
-/* ========= MAIN ========= */
-async function handleEvent(event) {
-  /* ==== 画像メッセージ ==== */
-  if (event.type === "message" && event.message.type === "image") {
+/* ========= 画像イベント ========= */
+async function handleImageEvent(event) {
+  try {
+    const stream = await lineClient.getMessageContent(event.message.id);
+    const buffer = await streamToBuffer(stream);
+    const base64Image = buffer.toString("base64");
+
+    const visionResp = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "この画像について、どんな場面・物・雰囲気なのか、やさしく日本語で説明してください。",
+            },
+            {
+              type: "input_image",
+              image_url: `data:image/jpeg;base64,${base64Image}`,
+            },
+          ],
+        },
+      ],
+    });
+
+    let answer =
+      "画像をうまく読み取れなかったみたい…もう一度送ってくれる？📷";
+
     try {
-      const stream = await lineClient.getMessageContent(event.message.id);
-      const buffer = await streamToBuffer(stream);
-      const b64 = buffer.toString("base64");
-
-      const vision = await openai.responses.create({
-        model: "gpt-4.1-mini",
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: "この画像について、どんな場面・物・雰囲気なのか優しく説明してください。",
-              },
-              {
-                type: "input_image",
-                image_url: `data:image/jpeg;base64,${b64}`,
-              },
-            ],
-          },
-        ],
-      });
-
-      let answer = "画像をうまく読み取れなかったみたい…もう一度送ってくれる？📷";
-
-      try {
-        const out = vision.output?.[0]?.content || [];
-        const t = out.filter((c) => c.type === "output_text").map((c) => c.text);
-        if (t.length) answer = t.join("\n").trim();
-      } catch {}
-
-      await lineClient.replyMessage(event.replyToken, { type: "text", text: answer });
-    } catch (err) {
-      await lineClient.replyMessage(event.replyToken, {
-        type: "text",
-        text: "画像を読み取れなかった…もう一度送ってみて！📷",
-      });
+      const first = visionResp.output?.[0];
+      if (first?.content?.length) {
+        answer = first.content
+          .filter((c) => c.type === "output_text")
+          .map((c) => c.text)
+          .join("\n")
+          .trim();
+      }
+    } catch (e) {
+      console.error("parse visionResp error:", e);
     }
-    return;
-  }
 
-  /* ==== テキスト ==== */
-  if (event.type !== "message" || event.message.type !== "text") return;
-
-  const userText = event.message.text.trim();
-  const conversationId = getConversationId(event);
-
-  if (userText === "リセット" || userText.toLowerCase() === "reset") {
-    await supabase.from("conversation_messages").delete().eq("conversation_id", conversationId);
     await lineClient.replyMessage(event.replyToken, {
       type: "text",
-      text: "会話履歴をリセットしたよ！",
+      text: answer,
+    });
+  } catch (err) {
+    console.error("Image analysis error:", err);
+    await lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: "画像をうまく読み取れなかったみたい…もう一度送ってくれる？📷",
+    });
+  }
+}
+
+/* ========= テキスト：2段階方式 ========= */
+async function handleTextEventTwoStep(event) {
+  const userText = (event.message.text ?? "").trim();
+  const conversationId = getConversationId(event);
+  const pushTarget = getPushTarget(event);
+
+  // リセットだけは即座にその場で処理（2段階にしない）
+  if (userText === "リセット" || userText.toLowerCase() === "reset") {
+    await supabase
+      .from("conversation_messages")
+      .delete()
+      .eq("conversation_id", conversationId);
+
+    await lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: "会話履歴をリセットしたよ。どうぞ！",
     });
     return;
   }
 
-  await saveMessage(conversationId, "user", userText);
-  const history = await fetchRecentMessages(conversationId);
+  // ① 即レス：「今ちょっと調べてるよ…」
+  await lineClient.replyMessage(event.replyToken, {
+    type: "text",
+    text: "今ちょっと調べてるよ…少しだけ待っててね🔍",
+  });
 
-  const intent = classifyIntent(userText);
-  let doResearch = intent !== "general";
+  // ② 裏で本処理 → pushMessage
+  (async () => {
+    try {
+      if (!pushTarget) return;
 
-  /* ==== 商品名抽出（product Intent のとき） ==== */
-  let tripmallURL = "";
-  if (intent === "product") {
-    const productName = await extractProductName(userText);
-    if (productName) {
-      const encoded = encodeURIComponent(productName);
-      tripmallURL = `https://tripmall.online/search/?q=${encoded}&sort=`;
+      await saveMessage(conversationId, "user", userText);
+      const history = await fetchRecentMessages(conversationId);
+
+      const intent = classifyIntent(userText);
+
+      // 商品intentならTRIPMALL用の商品名抽出
+      let productName = "";
+      let tripmallUrl = "";
+      if (intent === "product") {
+        productName = await extractProductName(userText);
+        if (productName) {
+          tripmallUrl = buildTripmallUrlFromProductName(productName);
+        }
+      }
+
+      const reply = await buildAiReply(userText, history, intent, tripmallUrl);
+
+      await saveMessage(conversationId, "assistant", reply);
+
+      await lineClient.pushMessage(pushTarget, {
+        type: "text",
+        text: reply,
+      });
+    } catch (e) {
+      console.error("handleTextEventTwoStep async error:", e);
     }
-  }
+  })();
+}
 
-  let reply = "";
+/* ========= 本回答生成ロジック ========= */
+async function buildAiReply(userText, history, intent, tripmallUrl) {
+  // 調査が必要か？
+  const needsResearch =
+    intent !== "general" ||
+    /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(
+      userText
+    );
 
-  /* ==== リサーチなし（雑談） ==== */
-  if (!doResearch) {
+  // 雑談・相談：OpenAIのみ
+  if (!needsResearch) {
     try {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -301,72 +431,16 @@ async function handleEvent(event) {
         temperature: 0.6,
         max_tokens: 800,
       });
-      reply = resp.choices?.[0]?.message?.content?.trim() || "…";
-    } catch {
-      reply = "ちょっと混み合ってるみたい…もう一度送ってみてね！";
+      return resp.choices?.[0]?.message?.content?.trim() || "…";
+    } catch (e) {
+      console.error("OpenAI error (chat):", e);
+      return "ちょっと混み合ってるみたい…もう一度送ってみて！";
     }
   }
 
-  /* ==== リサーチあり ==== */
-  else {
-    let social = [];
-    let web = [];
-    try {
-      social = await socialSearch(userText);
-      web = await webSearch(userText);
-    } catch (e) {
-      console.error("search error:", e);
-    }
-
-    const sources = [...social, ...web].slice(0, 2); // ★ SNS出典 最大2つ
-
-    /* プロンプト形成（TRIPMALL必ず追加） */
-    const hint = `
-以下の構造で自然な日本語でまとめてください（見出しなし）：
-- 一文の結論
-- 2〜4文の具体情報
-- SNS/WEBの最近の傾向（最大2件）
-- 代案・注意点（あれば）
-- 最後にオンライン最安値の横断検索（TRIPMALL）のURLを控えめに添える
-`;
-
-    let finalPrompt = `${userText}\n${hint}`;
-
-    if (sources.length) {
-      finalPrompt +=
-        "\n参考URL:\n" +
-        sources.map((s, i) => `(${i + 1}) ${s.link}`).join("\n");
-    }
-
-    if (tripmallURL) {
-      finalPrompt += `\nTRIPMALL_URL: ${tripmallURL}`;
-    }
-
-    try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          ...history,
-          { role: "user", content: finalPrompt },
-        ],
-        temperature: 0.5,
-        max_tokens: 1100,
-      });
-      reply = resp.choices?.[0]?.message?.content?.trim() || "…";
-    } catch (e) {
-      reply = "うまく調べられなかった…もう少し具体的に教えてくれる？";
-    }
-  }
-
-  await saveMessage(conversationId, "assistant", reply);
-
-  await lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: reply,
-  });
-}
-
-/* ========= Start ========= */
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`AI-kun running on ${port}`));
+  // リサーチモード
+  let social = [];
+  let web = [];
+  try {
+    [social, web] = await Promise.all([
+      socia
