@@ -462,7 +462,7 @@ async function buildAiReply(
 
       // 動画視聴希望なら BIGO LIVE を提案
       if (videoWish) {
-        reply += `\n\nこの動画配信アプリ「BIGO LIVE」でみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
+        reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
       }
 
       return reply;
@@ -526,7 +526,7 @@ async function buildAiReply(
 
     // 動画視聴希望なら BIGO LIVE を提案
     if (videoWish && !reply.includes(BIGO_LIVE_URL)) {
-      reply += `\n\nこの動画配信アプリ「BIGO LIVE」でみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
+      reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
     }
 
     return reply;
