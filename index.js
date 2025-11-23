@@ -1,12 +1,13 @@
 // ============================================================================
-// index.js — AIくん 完全版（429 防止版・高速レスポンス版）
+// index.js — AIくん 完全版（429 完全回避・安定版）
 //
-// ・テキスト：即レス「調べてるよ」→ 裏で本回答を生成 → pushMessage（レート制限つき）
+// ・テキスト：1回の replyMessage で本回答を返す（push 不使用）
 // ・画像：その場で解析して即返信（replyMessage）
 // ・SerpAPI + SNSリサーチ
 // ・TRIPMALL：商品名抽出（GPT）→ 検索URL自動付与
 // ・SNS出典：最大2件
 // ・「◯◯の動画が見たい」→ BIGO LIVE を必ず提案
+// ・Supabase: RLS + service_role 対応
 // ============================================================================
 
 import express from "express";
@@ -77,51 +78,6 @@ function getConversationId(event) {
   if (s.roomId) return `room:${s.roomId}`;
   if (s.userId) return `user:${s.userId}`;
   return "unknown";
-}
-
-/* ========= Push 先 ID ========= */
-function getPushTarget(event) {
-  const s = event.source ?? {};
-  if (s.userId) return s.userId;
-  if (s.groupId) return s.groupId;
-  if (s.roomId) return s.roomId;
-  return null;
-}
-
-/* ========= Push 用簡易レートリミット ========= */
-// 同じ user/group/room へは最低何ミリ秒あけるか
-const PUSH_INTERVAL_MS = 5000;
-const lastPushAt = new Map(); // key: pushTarget, value: timestamp(ms)
-
-function safePushMessage(pushTarget, message) {
-  if (!pushTarget) return;
-
-  const now = Date.now();
-  const last = lastPushAt.get(pushTarget) ?? 0;
-  const diff = now - last;
-
-  const wait = diff >= PUSH_INTERVAL_MS ? 0 : PUSH_INTERVAL_MS - diff;
-
-  const doPush = async () => {
-    try {
-      await lineClient.pushMessage(pushTarget, message);
-      lastPushAt.set(pushTarget, Date.now());
-    } catch (err) {
-      const status = err?.status ?? err?.response?.status;
-      console.error("pushMessage error:", status, err?.response?.data || err);
-      if (status === 429) {
-        console.error("LINE push rate limit hit; skipped one push.");
-      }
-    }
-  };
-
-  if (wait === 0) {
-    // すぐ送れる
-    void doPush();
-  } else {
-    // 少し待ってから送る（429防止）
-    setTimeout(() => void doPush(), wait);
-  }
 }
 
 /* ========= DB ========= */
@@ -340,19 +296,19 @@ app.post("/callback", line.middleware(config), async (req, res) => {
 
     await Promise.all(
       events.map(async (event) => {
-        // 画像は従来どおり即返信
+        // 画像
         if (event.type === "message" && event.message?.type === "image") {
           await handleImageEvent(event);
           return;
         }
 
-        // テキストは 2段階方式
+        // テキスト
         if (event.type === "message" && event.message?.type === "text") {
-          await handleTextEventTwoStep(event);
+          await handleTextEvent(event);
           return;
         }
 
-        // それ以外は今は無視
+        // それ以外は無視
       })
     );
 
@@ -418,13 +374,12 @@ async function handleImageEvent(event) {
   }
 }
 
-/* ========= テキスト：2段階方式（429対策版） ========= */
-async function handleTextEventTwoStep(event) {
+/* ========= テキスト：1回返信方式（429完全回避） ========= */
+async function handleTextEvent(event) {
   const userText = (event.message.text ?? "").trim();
   const conversationId = getConversationId(event);
-  const pushTarget = getPushTarget(event);
 
-  // リセットだけは即座にその場で処理（2段階にしない）
+  // リセット
   if (userText === "リセット" || userText.toLowerCase() === "reset") {
     await supabase
       .from("conversation_messages")
@@ -441,64 +396,41 @@ async function handleTextEventTwoStep(event) {
   const intent = classifyIntent(userText);
   const videoWish = isVideoWish(userText);
 
-  const needsResearch =
-    intent !== "general" ||
-    /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(
-      userText
-    ) ||
-    isProductIntent(userText) ||
-    videoWish;
+  // ユーザー発話保存
+  await saveMessage(conversationId, "user", userText);
+  const history = await fetchRecentMessages(conversationId);
 
-  // ① 即レス（replyMessage） — 高速レスポンス
-  const quickReplyText = needsResearch
-    ? "今ちょっと調べてるよ…少しだけ待っててね🔍"
-    : "うん、ちょっと考えてるよ…🤔";
+  // 商品intentならTRIPMALL用の商品名抽出
+  let productName = "";
+  let tripmallUrl = "";
+  if (intent === "product") {
+    productName = await extractProductName(userText);
+    if (productName) {
+      tripmallUrl = buildTripmallUrlFromProductName(productName);
+    }
+  }
 
+  // 本回答生成
+  const reply = await buildAiReply(
+    userText,
+    history,
+    intent,
+    tripmallUrl,
+    videoWish
+  );
+
+  // アシスタント発話保存
+  await saveMessage(conversationId, "assistant", reply);
+
+  // 1回の replyMessage で本回答を返す（push 不使用 → 429完全回避）
   try {
     await lineClient.replyMessage(event.replyToken, {
       type: "text",
-      text: quickReplyText,
+      text: reply,
     });
   } catch (e) {
-    console.error("quick reply error:", e);
+    console.error("replyMessage error:", e);
   }
-
-  // ② 裏で本処理 → safePushMessage（429対策付き）
-  (async () => {
-    try {
-      if (!pushTarget) return;
-
-      await saveMessage(conversationId, "user", userText);
-      const history = await fetchRecentMessages(conversationId);
-
-      // 商品intentならTRIPMALL用の商品名抽出
-      let productName = "";
-      let tripmallUrl = "";
-      if (intent === "product") {
-        productName = await extractProductName(userText);
-        if (productName) {
-          tripmallUrl = buildTripmallUrlFromProductName(productName);
-        }
-      }
-
-      const reply = await buildAiReply(
-        userText,
-        history,
-        intent,
-        tripmallUrl,
-        videoWish
-      );
-
-      await saveMessage(conversationId, "assistant", reply);
-
-      safePushMessage(pushTarget, {
-        type: "text",
-        text: reply,
-      });
-    } catch (e) {
-      console.error("handleTextEventTwoStep async error:", e);
-    }
-  })();
 }
 
 /* ========= 本回答生成ロジック ========= */
@@ -528,10 +460,15 @@ async function buildAiReply(
         temperature: 0.6,
         max_tokens: 800,
       });
-      let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+      let reply = resp.choices?.[0]?.message?.content?.trim() || "";
 
       if (videoWish) {
         reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
+      }
+
+      if (!reply || typeof reply !== "string" || reply.trim() === "") {
+        reply =
+          "ちょっと考えてみたけど、うまく答えをまとめられなかった…🙇\nもしよかったら、もう少しだけ詳しく教えてほしい！";
       }
 
       return reply;
@@ -581,7 +518,7 @@ async function buildAiReply(
       max_tokens: 1100,
     });
 
-    let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
+    let reply = resp.choices?.[0]?.message?.content?.trim() || "";
 
     if (intent === "product" && tripmallUrl && !reply.includes(tripmallUrl)) {
       reply += `\n\nオンライン最安値の横断検索はこちら：\n${tripmallUrl}`;
@@ -593,6 +530,11 @@ async function buildAiReply(
 
     if (videoWish && !reply.includes(BIGO_LIVE_URL)) {
       reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
+    }
+
+    if (!reply || typeof reply !== "string" || reply.trim() === "") {
+      reply =
+        "いろいろ調べてみたけど、うまく答えをまとめられなかった…🙇\n対象や条件を、もう少しだけ具体的に教えてもらえる？";
     }
 
     return reply;
