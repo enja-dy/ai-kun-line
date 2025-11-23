@@ -1,7 +1,8 @@
 // ============================================================================
-// index.js — AIくん 完全版
-// ・テキスト：即レス「調べてるよ」→ 後から本回答（pushMessage）
-// ・画像：その場で解析して即返信
+// index.js — AIくん 完全版（429 防止版・高速レスポンス版）
+//
+// ・テキスト：即レス「調べてるよ」→ 裏で本回答を生成 → pushMessage（レート制限つき）
+// ・画像：その場で解析して即返信（replyMessage）
 // ・SerpAPI + SNSリサーチ
 // ・TRIPMALL：商品名抽出（GPT）→ 検索URL自動付与
 // ・SNS出典：最大2件
@@ -25,7 +26,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 /* ========= Supabase ========= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE,
+  process.env.SUPABASE_SERVICE_ROLE, // service_role を使う
   { auth: { persistSession: false } }
 );
 
@@ -87,16 +88,57 @@ function getPushTarget(event) {
   return null;
 }
 
+/* ========= Push 用簡易レートリミット ========= */
+// 同じ user/group/room へは最低何ミリ秒あけるか
+const PUSH_INTERVAL_MS = 5000;
+const lastPushAt = new Map(); // key: pushTarget, value: timestamp(ms)
+
+function safePushMessage(pushTarget, message) {
+  if (!pushTarget) return;
+
+  const now = Date.now();
+  const last = lastPushAt.get(pushTarget) ?? 0;
+  const diff = now - last;
+
+  const wait = diff >= PUSH_INTERVAL_MS ? 0 : PUSH_INTERVAL_MS - diff;
+
+  const doPush = async () => {
+    try {
+      await lineClient.pushMessage(pushTarget, message);
+      lastPushAt.set(pushTarget, Date.now());
+    } catch (err) {
+      const status = err?.status ?? err?.response?.status;
+      console.error("pushMessage error:", status, err?.response?.data || err);
+      if (status === 429) {
+        console.error("LINE push rate limit hit; skipped one push.");
+      }
+    }
+  };
+
+  if (wait === 0) {
+    // すぐ送れる
+    void doPush();
+  } else {
+    // 少し待ってから送る（429防止）
+    setTimeout(() => void doPush(), wait);
+  }
+}
+
 /* ========= DB ========= */
 const HISTORY_LIMIT = 12;
 
 async function fetchRecentMessages(conversationId) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("conversation_messages")
     .select("role, content, created_at")
     .eq("conversation_id", conversationId)
     .order("created_at", { ascending: false })
     .limit(HISTORY_LIMIT * 2);
+
+  if (error) {
+    console.error("fetchRecentMessages error:", error);
+    return [];
+  }
 
   return (data ?? [])
     .reverse()
@@ -105,9 +147,12 @@ async function fetchRecentMessages(conversationId) {
 }
 
 async function saveMessage(conversationId, role, content) {
-  await supabase.from("conversation_messages").insert([
+  const { error } = await supabase.from("conversation_messages").insert([
     { conversation_id: conversationId, role, content },
   ]);
+  if (error) {
+    console.error("saveMessage error:", error);
+  }
 }
 
 /* ========= SerpAPI Google Search ========= */
@@ -222,7 +267,6 @@ function isVideoWish(text) {
   if (!text) return false;
   const t = text.trim();
 
-  // 明示的な「動画が見たい／探してる」パターン
   if (
     /動画が見たい|動画見たい|動画を見たい|動画探してる|動画を探している|動画ないかな|動画みたい/i.test(
       t
@@ -231,15 +275,12 @@ function isVideoWish(text) {
     return true;
   }
 
-  // 「〇〇の動画」「〇〇動画」「〇〇の動画？」など、
-  // 文末が「動画」で終わるコメントも「見たい」とみなす
   if (/動画[！!？\?」]*$/.test(t)) {
     return true;
   }
 
   return false;
 }
-
 
 /* ========= Intent分類 ========= */
 function classifyIntent(text) {
@@ -377,7 +418,7 @@ async function handleImageEvent(event) {
   }
 }
 
-/* ========= テキスト：2段階方式 ========= */
+/* ========= テキスト：2段階方式（429対策版） ========= */
 async function handleTextEventTwoStep(event) {
   const userText = (event.message.text ?? "").trim();
   const conversationId = getConversationId(event);
@@ -397,36 +438,38 @@ async function handleTextEventTwoStep(event) {
     return;
   }
 
-// intent判定を先に行う
-const intent = classifyIntent(userText);
+  const intent = classifyIntent(userText);
+  const videoWish = isVideoWish(userText);
 
-// リサーチが必要な場合のみ「今ちょっと調べてるよ…」を送る
-const needsResearch =
-  intent !== "general" ||
-  /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(userText) ||
-  isProductIntent(userText) ||
-  isVideoWish(userText);
+  const needsResearch =
+    intent !== "general" ||
+    /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(
+      userText
+    ) ||
+    isProductIntent(userText) ||
+    videoWish;
 
-if (needsResearch) {
-  await lineClient.replyMessage(event.replyToken, {
-    type: "text",
-    text: "今ちょっと調べてるよ…少しだけ待っててね🔍",
-  });
-} else {
-  // 普通の会話なら即レスしない → このまま裏で普通の返答を作り pushMessage
-}
+  // ① 即レス（replyMessage） — 高速レスポンス
+  const quickReplyText = needsResearch
+    ? "今ちょっと調べてるよ…少しだけ待っててね🔍"
+    : "うん、ちょっと考えてるよ…🤔";
 
+  try {
+    await lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: quickReplyText,
+    });
+  } catch (e) {
+    console.error("quick reply error:", e);
+  }
 
-  // ② 裏で本処理 → pushMessage
+  // ② 裏で本処理 → safePushMessage（429対策付き）
   (async () => {
     try {
       if (!pushTarget) return;
 
       await saveMessage(conversationId, "user", userText);
       const history = await fetchRecentMessages(conversationId);
-
-      const intent = classifyIntent(userText);
-      const videoWish = isVideoWish(userText);
 
       // 商品intentならTRIPMALL用の商品名抽出
       let productName = "";
@@ -448,7 +491,7 @@ if (needsResearch) {
 
       await saveMessage(conversationId, "assistant", reply);
 
-      await lineClient.pushMessage(pushTarget, {
+      safePushMessage(pushTarget, {
         type: "text",
         text: reply,
       });
@@ -466,7 +509,6 @@ async function buildAiReply(
   tripmallUrl,
   videoWish
 ) {
-  // 調査が必要か？
   const needsResearch =
     intent !== "general" ||
     /(最新|速報|価格|値段|在庫|比較|レビュー|評判|ニュース|動画)/.test(
@@ -488,7 +530,6 @@ async function buildAiReply(
       });
       let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
 
-      // 動画視聴希望なら BIGO LIVE を提案
       if (videoWish) {
         reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
       }
@@ -542,17 +583,14 @@ async function buildAiReply(
 
     let reply = resp.choices?.[0]?.message?.content?.trim() || "…";
 
-    // 商品intentだがモデルがURLを使わなかった場合の保険として、必ず最後に追加
     if (intent === "product" && tripmallUrl && !reply.includes(tripmallUrl)) {
       reply += `\n\nオンライン最安値の横断検索はこちら：\n${tripmallUrl}`;
     }
 
-    // 出典が本文に無ければ追加（最大2件）
     if (sources.length && !/(https?:\/\/\S+)/.test(reply)) {
       reply += renderSources(sources);
     }
 
-    // 動画視聴希望なら BIGO LIVE を提案
     if (videoWish && !reply.includes(BIGO_LIVE_URL)) {
       reply += `\n\nこの動画配信アプリ「BIGO LIVE」でもみれるよ。いろんなライブ配信も楽しめるよ。よかったらインストールしてみて。\n${BIGO_LIVE_URL}`;
     }
